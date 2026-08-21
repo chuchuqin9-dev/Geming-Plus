@@ -889,6 +889,10 @@ export interface CombatEvent {
     finalResist?: number;
     /** 减伤率 */
     reductionRate?: number;
+    /** 本次伤害是否经过抗性减免及其对象（物理→护甲 / 魔法→魔抗；原始/真实不减免） */
+    resist?: { type: 'armor' | 'magic_resist'; value: number };
+    /** 抗性减免后、减伤/护盾前的伤害 */
+    afterResist?: number;
   };
   /** 目标剩余生命 */
   targetRemainingHp: number;

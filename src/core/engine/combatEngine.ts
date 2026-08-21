@@ -824,6 +824,25 @@ export class CombatEngine {
       target.combatant.alive = true;
     }
 
+    // 临时调试日志（技能/伤害计算链路逐步追踪）：
+    //  技能名称 → 输入原始伤害(含倍率) → 倍率加成部分 → 类型判断 → 防御计算前伤害
+    //  → 抗性(护甲/魔抗→值) → 抗性减伤率 → 抗性后伤害 → 最终扣血
+    // eslint-disable-next-line no-console
+    console.debug('[伤害结算]', {
+      skill: meta.skillName ?? (sourceKind === 'basic_attack' ? '普攻' : sourceKind),
+      rawInput: raw,
+      scaleAdd: raw - base,
+      damageType,
+      beforeDamage: raw,
+      ...(damageType === 'physical'
+        ? { armor: finalResist, reductionRate: ((resistRate) * 100).toFixed(2) + '%' }
+        : damageType === 'magic'
+          ? { magicResist: finalResist, reductionRate: ((resistRate) * 100).toFixed(2) + '%' }
+          : { bypassDefense: true }),
+      afterResist: afterResist,
+      hpLoss: appliedLoss,
+    });
+
     this.emit(crit ? 'crit' : seg.kind === 'dot' ? 'dot_tick' : 'damage', source.id, target.id, {
       skillId: meta.skillId, skillName: meta.skillName, itemId: meta.itemId, itemName: meta.itemName,
       talentId: meta.talentId, talentName: meta.talentName,
@@ -831,7 +850,17 @@ export class CombatEngine {
       targetRemainingHp: target.combatant.hp,
       rootEventId: chain?.rootEventId, parentEventId: this.events.length, sourceEffectId: chain ? chain.path[chain.path.length - 1] : undefined, triggerDepth: chain?.depth,
       description: `${source.combatant.label}${crit ? ' 暴击！' : ''} 造成【原始伤害 ${f(raw)} → ${damageTypeLabel(damageType)} ${f(appliedLoss)}最终伤害】${absorbed > 0 ? `（护盾吸收 ${f(absorbed)}）` : ''}`,
-      details: { finalResist, reductionRate: resistRate },
+      details: {
+        finalResist,
+        reductionRate: resistRate,
+        // 显式标注本击是否经过了抗性减免，以及减免对象（护甲/魔抗）与最终抗性值
+        resist: damageType === 'physical'
+          ? { type: 'armor' as const, value: finalResist }
+          : damageType === 'magic'
+            ? { type: 'magic_resist' as const, value: finalResist }
+            : undefined,
+        afterResist: afterResist,
+      },
     });
 
     // 统计

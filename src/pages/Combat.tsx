@@ -305,6 +305,16 @@ function ResultView({ result, onSave, onClear }: { result: CombatResult; onSave:
               <span className="t">{fmtTime(e.timestampMs)}</span>
               <b> {e.description || e.eventType}</b>
               {e.finalDamage > 0 && <div className="detail">实际伤害 {num(e.finalDamage)}（原伤害 {num(e.rawDamage)}）{e.crit ? '· 暴击' : ''}</div>}
+              {e.finalDamage > 0 && e.details?.reductionRate != null && (
+                <div className="detail">
+                  {e.details.resist
+                    ? `${e.details.resist.type === 'armor' ? '护甲' : '魔抗'} ${e.details.resist.value} → 减伤 ${(e.details.reductionRate * 100).toFixed(1)}%`
+                    : '无视防御（原始/真实伤害不减免）'}
+                </div>
+              )}
+              {e.details?.afterResist != null && Math.abs(e.details.afterResist - e.finalDamage) > 0.0001 && e.details.reductionRate != null && (
+                <div className="detail">抗性后 {num(e.details.afterResist)} → 最终 {num(e.finalDamage)}</div>
+              )}
               {e.absorbedByShield > 0 && <div className="detail">护盾吸收 {num(e.absorbedByShield)}</div>}
             </div>
           ))}
