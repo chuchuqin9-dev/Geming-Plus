@@ -609,8 +609,11 @@ export interface Hero {
   type: HeroType;
   /** 基础属性（健康默认值，由 defaults 提供） */
   baseStats: HeroStats;
-  /** 技能列表（数量不限）。普攻由引擎内置，不在此定义 */
-  skills: Skill[];
+  /**
+   * 技能列表（数量不限）：保存「技能库」中技能的 id（引用，不复制技能定义）。
+   * 普攻由引擎内置，不在此定义。实际技能由技能库经 skillId 关联解析。
+   */
+  skills: string[];
   /** 默认装备方案（装备 id 列表，最多 MAX_EQUIPMENT） */
   defaultItems: string[];
   /** 绑定天赋（英雄专属天赋模板 id 列表） */
@@ -671,6 +674,11 @@ export interface TalentBook {
 export interface CombatantConfig {
   label: string;
   hero: Hero;
+  /**
+   * 该英雄实际携带的技能（由 hero.skills 的 skillId 从技能库解析后的完整对象），
+   * 供战斗引擎直接使用。解析在建配置时完成，与模板解耦。
+   */
+  skills: Skill[];
   itemIds: string[]; // <= MAX_EQUIPMENT
   /** 本英雄佩戴的天赋（已解析为完整对象，便于战斗隔离） */
   talents: Talent[];

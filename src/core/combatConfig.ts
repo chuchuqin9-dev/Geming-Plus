@@ -3,10 +3,11 @@
  */
 import {
   type CombatConfig, type CombatantConfig, type DummyConfig, type Hero,
-  type RandomMode, type SimMode, type Talent,
+  type RandomMode, type SimMode, type Talent, type Skill,
   MAX_EQUIPMENT,
 } from './types';
 import { newDummy } from './defaults';
+import { resolveHeroSkills } from './heroSkills';
 
 export interface BuildOptions {
   mode: SimMode;
@@ -16,6 +17,8 @@ export interface BuildOptions {
   trueDamageIgnoresReduction?: boolean;
   /** 真实伤害是否可被全类型护盾吸收 */
   trueDamageAffectsShield?: boolean;
+  /** 技能库（用于按英雄 skills 的 skillId 解析出实际技能给引擎）。缺省时英雄无技能 */
+  skills?: Skill[];
   heroA: Hero;
   itemsA: string[];
   talentsA?: Talent[];
@@ -30,14 +33,17 @@ export interface BuildOptions {
 }
 
 export function buildCombatConfig(opts: BuildOptions): CombatConfig {
+  const lib = opts.skills || [];
   const combos: CombatantConfig[] = [];
   combos.push({
     label: opts.labelA || opts.heroA.name, hero: opts.heroA,
+    skills: resolveHeroSkills(opts.heroA, lib),
     itemIds: opts.itemsA.slice(0, MAX_EQUIPMENT), talents: opts.talentsA || [],
   });
   if (opts.mode === 'vs' && opts.heroB) {
     combos.push({
       label: opts.labelB || opts.heroB.name, hero: opts.heroB,
+      skills: resolveHeroSkills(opts.heroB, lib),
       itemIds: (opts.itemsB || []).slice(0, MAX_EQUIPMENT), talents: opts.talentsB || [],
     });
   }

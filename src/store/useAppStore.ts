@@ -17,6 +17,7 @@ import { defaultAdapter } from '../storage/localAdapter';
 import { buildCombatConfig, validateConfig } from '../core/combatConfig';
 import { runCombat } from '../core/engine/combatEngine';
 import { uid, newHero, newDummy } from '../core/defaults';
+import { migrateHeroSkillRefs } from '../core/heroSkills';
 import { buildBackup, downloadBackup, parseBackup } from '../storage/exports';
 import { MAX_EQUIPMENT } from '../core/types';
 
@@ -96,7 +97,9 @@ export const useAppStore = create<AppState>((set, get) => {
       adapter.listBattlePresets(),
       adapter.listSavedSimulations(),
     ]);
-    set({ heroes, equipment, skills, talents, talentBooks, battlePresets, savedSimulations, ready: true });
+    // 迁移旧版英雄内嵌技能 → 技能库引用（保持技能定义与引用一致）
+    const mig = migrateHeroSkillRefs(heroes, skills);
+    set({ heroes: mig.heroes, equipment, skills: mig.library, talents, talentBooks, battlePresets, savedSimulations, ready: true });
   };
 
   const equipmentNameById = () => {
@@ -234,20 +237,24 @@ export const useAppStore = create<AppState>((set, get) => {
 
     importBackup: async (text, mode) => {
       const backup = parseBackup(text);
+      // 迁移旧版英雄内嵌技能 → 技能库引用（与数据落地一致）
+      const mig = migrateHeroSkillRefs(backup.heroes, backup.skills);
+      const heroes = mig.heroes;
+      const skills = mig.library;
       if (mode === 'replace') {
         await adapter.replaceAll({
-          heroes: backup.heroes,
+          heroes,
           equipment: backup.equipment,
-          skills: backup.skills,
+          skills,
           talents: backup.talents,
           talentBooks: backup.talentBooks,
           battlePresets: backup.battlePresets,
           savedSimulations: backup.savedSimulations,
         });
       } else {
-        for (const h of backup.heroes) await adapter.saveHero(h);
+        for (const h of heroes) await adapter.saveHero(h);
         for (const e of backup.equipment) await adapter.saveEquipment(e);
-        for (const s of backup.skills) await adapter.saveSkill(s);
+        for (const s of skills) await adapter.saveSkill(s);
         for (const t of backup.talents) await adapter.saveTalent(t);
         for (const b of backup.talentBooks) await adapter.saveTalentBook(b);
         for (const p of backup.battlePresets) await adapter.saveBattlePreset(p);

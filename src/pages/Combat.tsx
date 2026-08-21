@@ -11,7 +11,7 @@ import type { CombatConfig, CombatantId, CombatResult, Hero, Talent } from '../c
 import { MAX_EQUIPMENT } from '../core/types';
 
 export function Combat() {
-  const { heroes, equipment, talents, result, running, setCombatConfig, runSimulation, saveSimulation, clearResult } = useAppStore();
+  const { heroes, equipment, skills, talents, result, running, setCombatConfig, runSimulation, saveSimulation, clearResult } = useAppStore();
 
   const [mode, setMode] = useState<'dummy' | 'vs'>('dummy');
   const [duration, setDuration] = useState(30);
@@ -35,6 +35,7 @@ export function Combat() {
       durationSeconds: duration,
       randomMode,
       seed,
+      skills,
       heroA,
       itemsA,
       talentsA: resolveTalents(talents, talentsA, heroA.id),
@@ -44,8 +45,8 @@ export function Combat() {
       talentsB: heroB ? resolveTalents(talents, talentsB, heroB.id) : undefined,
       labelB: heroB?.name,
       dummy,
-      skillPriorityA: heroA.skills.map((s) => s.id),
-      skillPriorityB: heroB?.skills.map((s) => s.id),
+      skillPriorityA: heroA.skills,
+      skillPriorityB: heroB?.skills,
     });
     setCombatConfig(config);
     runSimulation();

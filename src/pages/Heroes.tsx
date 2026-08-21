@@ -1,16 +1,19 @@
 /**
  * 英雄库：列表 + 英雄编辑（属性 / 技能 / 默认装备）
+ *
+ * 技能管理采用「技能库引用」模型：英雄只保存技能库中的 skillId，
+ * 实际技能由技能库经 skillId 关联解析。支持搜索选择、防重、排序、删除（带确认）。
  */
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import { useAppStore } from '../store/useAppStore';
 import { Card, SectionLabel, SelectField } from '../components/ui';
 import { HeroStatsEditor } from '../components/heroStatsEditor';
-import { SkillEditor } from '../components/skillEditor';
-import { uid, newHero, newSkill } from '../core/defaults';
-import type { Hero } from '../core/types';
+import { uid, newHero } from '../core/defaults';
+import { describeSkillSegments, resolveHeroSkills } from '../core/heroSkills';
+import type { Hero, Skill } from '../core/types';
 
 export function Heroes() {
-  const { heroes, equipment, upsertHero, removeHero, selectedHeroId, selectHero } = useAppStore();
+  const { heroes, equipment, skills, upsertHero, removeHero, selectedHeroId, selectHero } = useAppStore();
   const h = heroes.find((x) => x.id === selectedHeroId) ?? heroes[0] ?? null;
   const sorted = useMemo(() => [...heroes].sort((a, b) => a.name.localeCompare(b.name)), [heroes]);
 
@@ -38,7 +41,7 @@ export function Heroes() {
 
       <div>
         {h ? (
-          <HeroEditor key={h.id} hero={h} equipment={equipment} onSave={upsertHero} />
+          <HeroEditor key={h.id} hero={h} equipment={equipment} skills={skills} onSave={upsertHero} />
         ) : (
           <Card><p className="muted">请先创建或选择一个英雄。</p></Card>
         )}
@@ -47,7 +50,7 @@ export function Heroes() {
   );
 }
 
-function HeroEditor({ hero, equipment, onSave }: { hero: Hero; equipment: Array<{ id: string; name: string }>; onSave: (h: Hero) => void }) {
+function HeroEditor({ hero, equipment, skills, onSave }: { hero: Hero; equipment: Array<{ id: string; name: string }>; skills: Skill[]; onSave: (h: Hero) => void }) {
   const patch = (p: Partial<Hero>) => onSave({ ...hero, ...p });
 
   return (
@@ -88,16 +91,127 @@ function HeroEditor({ hero, equipment, onSave }: { hero: Hero; equipment: Array<
         </div>
       </Card>
 
-      <Card title="技能" actions={<button className="btn sm primary" onClick={() => patch({ skills: [...hero.skills, newSkill()] })}>+ 添加技能</button>}>
-        <div style={{ display: 'grid', gap: 12 }}>
-          {hero.skills.map((s, i) => (
-            <div key={s.id}>
-              <SkillEditor value={s} onChange={(ns) => { const next = [...hero.skills]; next[i] = ns; patch({ skills: next }); }} />
+      <SkillManager hero={hero} skills={skills} onChange={(ids) => patch({ skills: ids })} />
+    </>
+  );
+}
+
+/** 英雄技能配置：技能库选择 + 已选技能列表（排序 / 删除 / 确认） */
+function SkillManager({ hero, skills, onChange }: { hero: Hero; skills: Skill[]; onChange: (ids: string[]) => void }) {
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [search, setSearch] = useState('');
+  const [confirmId, setConfirmId] = useState<string | null>(null);
+
+  const selectedIds = hero.skills ?? [];
+  const resolved = useMemo(() => resolveHeroSkills(hero, skills), [hero, skills]);
+  const selectedMap = useMemo(() => new Set(selectedIds), [selectedIds]);
+
+  const addSkill = (id: string) => {
+    // 防止重复添加同一个技能
+    if (selectedMap.has(id)) return;
+    onChange([...selectedIds, id]);
+  };
+  const removeSkill = (id: string) => {
+    setConfirmId(null);
+    onChange(selectedIds.filter((x) => x !== id));
+  };
+  const move = (i: number, dir: -1 | 1) => {
+    const next = [...selectedIds];
+    const j = i + dir;
+    if (j < 0 || j >= next.length) return;
+    [next[i], next[j]] = [next[j], next[i]];
+    onChange(next);
+  };
+
+  // 技能库选择数据源：可直接读写技能库，且与英雄已选联动
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return skills.filter((s) => {
+      if (q && !(s.name.toLowerCase().includes(q) || (s.type === 'active' ? '主动' : '被动').includes(q))) return false;
+      return true;
+    });
+  }, [skills, search]);
+
+  return (
+    <Card title={`技能 (${resolved.length})`} actions={<button className="btn sm primary" onClick={() => setPickerOpen(true)}>+ 添加技能</button>}>
+      {/* 已选技能列表（卡片式） */}
+      {resolved.length > 0 ? (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {resolved.map((s, i) => (
+            <div key={s.id} className="skill-card-row">
+              <div className="row" style={{ flex: 1, gap: 8, alignItems: 'center' }}>
+                <span className="badge">{i + 1}</span>
+                <span className={`badge ${s.type === 'passive' ? 'badge-passive' : ''}`}>{s.type === 'active' ? '主动' : '被动'}</span>
+                <div className="skill-head" style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontWeight: 600 }}>{s.name}</div>
+                  <div className="muted" style={{ fontSize: 12, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{describeSkillSegments(s.segments)}</div>
+                </div>
+              </div>
+              <div className="row" style={{ gap: 4 }}>
+                <button className="btn sm ghost" title="上移" onClick={() => move(i, -1)} disabled={i === 0}>↑</button>
+                <button className="btn sm ghost" title="下移" onClick={() => move(i, 1)} disabled={i === resolved.length - 1}>↓</button>
+                <button className="btn sm ghost danger" title="删除技能" onClick={() => setConfirmId(s.id)}>删除</button>
+              </div>
             </div>
           ))}
-          {!hero.skills.length && <p className="muted">暂无技能。英雄将只进行普通攻击。</p>}
         </div>
-      </Card>
-    </>
+      ) : (
+        <p className="muted">暂无技能。点击「+ 添加技能」从技能库中选择。英雄将只进行普通攻击。</p>
+      )}
+
+      {/* 删除确认 + 技能选择弹窗 */}
+      {confirmId && (
+        <div className="modal-backdrop" onClick={() => setConfirmId(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h3>删除技能</h3>
+            <p>确定将该技能从英雄技能栏移除吗？技能库中的定义不会被删除。</p>
+            <div className="row" style={{ justifyContent: 'flex-end' }}>
+              <button className="btn" onClick={() => setConfirmId(null)}>取消</button>
+              <button className="btn danger" onClick={() => removeSkill(confirmId)}>确认删除</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {pickerOpen && (
+        <div className="modal-backdrop" onClick={() => { setPickerOpen(false); setSearch(''); }}>
+          <div className="modal skill-picker" onClick={(e) => e.stopPropagation()}>
+            <h3>选择技能</h3>
+            <div className="row" style={{ marginBottom: 10 }}>
+              <input placeholder="搜索技能名称 / 主动 / 被动" value={search} onChange={(e) => setSearch(e.target.value)} autoFocus />
+            </div>
+            {skills.length === 0 ? (
+              <p className="muted">技能库为空，请先到「技能库」创建技能模板，再回来选择。</p>
+            ) : filtered.length === 0 ? (
+              <p className="muted">没有匹配的技能。</p>
+            ) : (
+              <div className="skill-picker-grid">
+                {filtered.map((s) => {
+                  const added = selectedMap.has(s.id);
+                  return (
+                    <div key={s.id} className={`skill-pick-card ${added ? 'selected' : ''}`} onClick={() => { if (!added) addSkill(s.id); }}>
+                      <div className="row" style={{ justifyContent: 'space-between', gap: 6 }}>
+                        <span className={`badge ${s.type === 'passive' ? 'badge-passive' : ''}`}>{s.type === 'active' ? '主动' : '被动'}</span>
+                        {added && <span className="badge badge-added">已选择</span>}
+                      </div>
+                      <div style={{ fontWeight: 600 }}>{s.name}</div>
+                      <div className="muted" style={{ fontSize: 12 }}>{describeSkillSegments(s.segments)}</div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            <div className="row" style={{ justifyContent: 'flex-end', marginTop: 12 }}>
+              <button className="btn" onClick={() => { setPickerOpen(false); setSearch(''); }}>完成</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <SectionLabel>技能库 {skills.length ? `（共 ${skills.length} 个可选）` : '为空'}</SectionLabel>
+      <p className="muted" style={{ fontSize: 12, margin: 0 }}>
+        英雄技能通过 skillId 关联技能库，复用已创建的技能模板，避免数据重复。修改技能库中的技能会自动同步到引用它的英雄。
+      </p>
+    </Card>
   );
 }

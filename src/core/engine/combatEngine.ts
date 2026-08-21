@@ -311,7 +311,7 @@ export class CombatEngine {
       this.units.set(id, {
         id, isDummy: false, combatant,
         hero: {
-          skills: cfg.hero.skills,
+          skills: cfg.skills || [],
           items,
           talents: cfg.talents || [],
           basicAttack: buildBasicAttackSegment(combatant.stats),

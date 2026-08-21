@@ -167,6 +167,26 @@ td.num, th.num { text-align: right; font-family: var(--mono); }
 /* 错误横幅 */
 .banner-error { background: rgba(224, 85, 85, 0.12); color: var(--bad); border: 1px solid rgba(224, 85, 85, 0.4); padding: 10px 14px; border-radius: 8px; margin-bottom: 14px; display: flex; justify-content: space-between; align-items: center; }
 
+/* 英雄技能管理 */
+.skill-card-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
+  background: var(--bg-elev);
+}
+.skill-card-row:hover { border-color: var(--brand); }
+.skill-card-row .skill-head { min-width: 0; }
+.badge-passive { background: var(--brand-soft); color: var(--brand); }
+.badge-added { background: var(--brand); color: #fff; }
+.skill-picker { max-width: 680px; }
+.skill-picker-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; }
+.skill-pick-card {
+  border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
+  cursor: pointer; background: var(--bg-elev); transition: border-color 0.12s ease;
+  display: flex; flex-direction: column; gap: 6px;
+}
+.skill-pick-card:hover { border-color: var(--brand); }
+.skill-pick-card.selected { border-color: var(--brand); background: var(--brand-soft); }
+
 /* 三栏战斗布局 */
 .combat-cols { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; align-items: start; }
 

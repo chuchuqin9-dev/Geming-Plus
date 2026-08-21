@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
-  type CombatConfig, type Equipment, type Hero, type HeroStats, type ShieldType, type StatScaling, type Talent,
+  type CombatConfig, type Equipment, type Hero, type HeroStats, type ShieldType, type StatScaling, type Skill, type Talent,
   emptyStats,
 } from '../src/core/types';
 import { runCombat } from '../src/core/engine/combatEngine';
@@ -17,6 +17,16 @@ function hero(name: string, overrides: Partial<HeroStats> = {}): Hero {
     skills: [],
     defaultItems: [],
   };
+}
+
+// 技能都注册进技能库（模拟「英雄只存 skillId 引用」），Hero.skills 存 id 而非内嵌对象。
+const skillLib: Skill[] = [];
+function bind(h: Hero, ...skills: Skill[]): Hero {
+  for (const s of skills) {
+    if (!skillLib.some((x) => x.id === s.id)) skillLib.push(s);
+    if (!h.skills.includes(s.id)) h.skills.push(s.id);
+  }
+  return h;
 }
 
 function combatant(hero: Hero, itemIds: string[] = [], label?: string) {
@@ -38,6 +48,7 @@ function run(
     durationSeconds: opts.duration ?? 3,
     randomMode: opts.randomMode ?? 'expectation',
     seed: opts.seed,
+    skills: skillLib,
     heroA: opts.heroes[0],
     itemsA: opts.itemsA ?? [],
     talentsA: opts.talentsA,
@@ -51,7 +62,7 @@ function run(
 }
 
 /** 构造一个主动技能（可独立指定效果段） */
-function skillOf({ cd = 1, delay = 0 }: { cd?: number; delay?: number } = {}): Hero['skills'][number] {
+function skillOf({ cd = 1, delay = 0 }: { cd?: number; delay?: number } = {}): Skill {
   return {
     id: uid('s'),
     name: '技能',
@@ -114,9 +125,9 @@ describe('战斗引擎：可复现与真实伤害', () => {
   });
   it('真实伤害无视护甲', () => {
     const h = hero('A');
-    // 构造一个真实伤害技能
-    h.skills = [{ id: 's1', name: '真伤', type: 'active', active: { cooldownSeconds: 1, priority: 1, manaCost: 0 },
-      segments: [{ kind: 'damage', delaySeconds: 0, baseDamage: 100, scaling: [], damageType: 'true', canCrit: false, critFamily: 'physical', canLifesteal: true, canTriggerItems: true, sourceKind: 'skill', isSkillBoost: true, useMagicDamageBoost: true }] }];
+    // 构造一个真实伤害技能并注册进技能库，英雄只引用其 id
+    bind(h, { id: 's1', name: '真伤', type: 'active', active: { cooldownSeconds: 1, priority: 1, manaCost: 0 },
+      segments: [{ kind: 'damage', delaySeconds: 0, baseDamage: 100, scaling: [], damageType: 'true', canCrit: false, critFamily: 'physical', canLifesteal: true, canTriggerItems: true, sourceKind: 'skill', isSkillBoost: true, useMagicDamageBoost: true }] });
     const result = run({ heroes: [h], duration: 2, dummyArmor: 1000 });
     const r = result.results.find((x) => x.id === 'A')!;
     // 护甲 1000 下普攻几乎免疫；真伤 100×3=300 全量生效
@@ -145,7 +156,7 @@ describe('战斗引擎：真实伤害公式（固定值 + 属性倍率）', () =
 
   it('攻击 200、100 基础真伤 + 30% 攻击倍率 → 每次 160，3 次共 480', () => {
     const h = hero('A', { attack: 200 });
-    h.skills = [{ ...skillOf({ cd: 1 }), name: '真伤', segments: [trueSkill(100, [{ stat: 'attack', ratio: 0.3 }])] }];
+    bind(h, { ...skillOf({ cd: 1 }), name: '真伤', segments: [trueSkill(100, [{ stat: 'attack', ratio: 0.3 }])] });
     const result = run({ heroes: [h], duration: 2, dummyArmor: 1000 });
     const r = result.results.find((x) => x.id === 'A')!;
     expect(r.damage.trueDmg).toBe(480); // 0/1/2 共 3 次 × 160，真伤无视 1000 护甲
@@ -154,7 +165,7 @@ describe('战斗引擎：真实伤害公式（固定值 + 属性倍率）', () =
 
   it('敌方最大生命 10% 真伤：木桩 100000 → 10000', () => {
     const h = hero('A');
-    h.skills = [{ ...skillOf({ cd: 100 }), name: '真伤%', segments: [trueSkill(0, [{ stat: 'targetMaxHp', ratio: 0.1 }])] }];
+    bind(h, { ...skillOf({ cd: 100 }), name: '真伤%', segments: [trueSkill(0, [{ stat: 'targetMaxHp', ratio: 0.1 }])] });
     const result = run({ heroes: [h], duration: 1, dummyArmor: 1000 });
     const r = result.results.find((x) => x.id === 'A')!;
     expect(r.damage.trueDmg).toBe(10000);
@@ -170,7 +181,7 @@ describe('战斗引擎：原始伤害（Raw Damage，见 #95）', () => {
 
   it('原始伤害 = 未经过护甲/减伤的基础数值，最终伤害与原始一致', () => {
     const h = hero('A');
-    h.skills = [{ ...skillOf({ cd: 1 }), name: '原始', segments: [rawSkill(500)] }];
+    bind(h, { ...skillOf({ cd: 1 }), name: '原始', segments: [rawSkill(500)] });
     const result = run({ heroes: [h], duration: 2, dummyArmor: 1000, dummyMr: 0 });
     const r = result.results.find((x) => x.id === 'A')!;
     // 3 次 × 500 原始伤害：不随护甲/减伤结算，技能伤害桶应恰好 1500（普攻伤害计入其自身桶）
@@ -179,7 +190,7 @@ describe('战斗引擎：原始伤害（Raw Damage，见 #95）', () => {
 
   it('日志区分原始伤害与最终伤害：rawDamage 与 finalDamage 相等且类型为 raw', () => {
     const h = hero('A');
-    h.skills = [{ ...skillOf({ cd: 1 }), name: '原始', segments: [rawSkill(500)] }];
+    bind(h, { ...skillOf({ cd: 1 }), name: '原始', segments: [rawSkill(500)] });
     const result = run({ heroes: [h], duration: 1 });
     const ev = result.events.find((e: any) => e.eventType === 'damage' && e.damageType === 'raw');
     expect(ev).toBeTruthy();
@@ -190,8 +201,9 @@ describe('战斗引擎：原始伤害（Raw Damage，见 #95）', () => {
   it('原始伤害可作为倍率属性来源：rawDamage 引用当前段基础伤害，随基础成长', () => {
     // baseDamage=200，倍率 50% × 原始伤害(200) = +100，最终原始伤害应为 300
     const h = hero('A');
-    h.skills = [{ ...skillOf({ cd: 1 }), name: '原始', segments: [rawSkill(200)] }];
-    h.skills[0].segments[0].scaling = [{ stat: 'rawDamage', ratio: 0.5 }];
+    const sk = { ...skillOf({ cd: 1 }), name: '原始', segments: [rawSkill(200)] } as Skill;
+    sk.segments[0].scaling = [{ stat: 'rawDamage', ratio: 0.5 }];
+    bind(h, sk);
     const result = run({ heroes: [h], duration: 1 });
     const ev = result.events.find((e: any) => e.eventType === 'damage' && e.damageType === 'raw');
     expect(ev).toBeTruthy();
@@ -213,7 +225,8 @@ describe('战斗引擎：天赋系统', () => {
 
   it('触发型天赋 战斗开始获得护盾：技能命中后减少自身冷却 5s → 冷却从 10s 提前到 5s（共 2 次释放）', () => {
     const h = hero('A');
-    h.skills = [skillOf({ cd: 10 })];
+    const sk = skillOf({ cd: 10 });
+    bind(h, sk);
     const reduce: Talent = {
       id: uid('t'), name: '冷却', description: '', type: 'triggered', heroId: null,
       trigger: { event: 'skill_hit' },
@@ -222,7 +235,7 @@ describe('战斗引擎：天赋系统', () => {
     const result = run({ heroes: [h], talentsA: [reduce], duration: 6 });
     const r = result.results.find((x) => x.id === 'A')!;
     // 无冷却减少：仅 0s 释放 1 次（下次 10s>6s）；减少后 0s/5s 各一次
-    expect(r.skills.find((s) => s.skillId === h.skills[0].id)!.castCount).toBe(2);
+    expect(r.skills.find((s) => s.skillId === sk.id)!.castCount).toBe(2);
   });
 });
 
@@ -244,10 +257,10 @@ describe('战斗引擎：护盾系统', () => {
   it('真实伤害默认无视护盾（trueDamageAffectsShield=false），全类型盾不吸收', () => {
     const a = hero('坦克', { attack: 0, armor: 0, maxHp: 5000, currentHp: 5000 });
     const b = hero('真伤', { attack: 0, armor: 0 });
-    b.skills = [{ ...skillOf({ cd: 100 }), name: '真伤', segments: [{
+    bind(b, { ...skillOf({ cd: 100 }), name: '真伤', segments: [{
       kind: 'damage', delaySeconds: 0, baseDamage: 200, scaling: [], damageType: 'true',
       canCrit: false, critFamily: 'physical', canLifesteal: true, canTriggerItems: true, sourceKind: 'skill', isSkillBoost: true, useMagicDamageBoost: true,
-    }] }];
+    }] });
     const result = run({ heroes: [a, b], talentsA: [shieldTalent('all', 500)], duration: 1 });
     const ra = result.results.find((x) => x.id === 'A')!;
     expect(ra.defense.allShieldAbsorbed).toBe(0);
@@ -356,25 +369,25 @@ describe('#178 伤害前护盾 / 距离伤害 / 生命阶梯增伤', () => {
       }],
     });
     // 200 距离 = 超最小距离 100 → 额外 +100；上限 maxBonusDamage=200
-    const near = hero('A'); near.skills = [mk(200)];
+    const near = hero('A'); bind(near, mk(200));
     const nearRes = run({ heroes: [near], duration: 1 }).results.find((x) => x.id === 'A')!;
     expect(nearRes.damage.skill).toBe(600); // 500 + 100
     // 超过最大距离 400 → 封顶 200，不再随距离增长
-    const far = hero('A'); far.skills = [mk(100000)];
+    const far = hero('A'); bind(far, mk(100000));
     const farRes = run({ heroes: [far], duration: 1 }).results.find((x) => x.id === 'A')!;
     expect(farRes.damage.skill).toBe(700); // 500 + 200（封顶）
   });
 
   it('生命值阶梯增伤达到上限后封顶', () => {
     const h = hero('A');
-    h.skills = [{
+    bind(h, {
       id: uid('s'), name: '斩', type: 'active',
       active: { cooldownSeconds: 100, priority: 1, manaCost: 0 },
       segments: [{
         ...trueSeg(300),
         hpBonus: { stat: 'targetMaxHp', op: '>=', value: 2000, bonusPercent: 10, perUnit: 500, perBonusPercent: 5, maxBonusPercent: 30 } as any,
       }],
-    }];
+    });
     // 木桩 maxHp 100000 ≥ 2000，基础 10% + 阶梯远超，但封顶 30%
     const r = run({ heroes: [h], duration: 1 }).results.find((x) => x.id === 'A')!;
     expect(r.damage.skill).toBe(300 * 1.30);
@@ -403,10 +416,10 @@ describe('#178 防无限触发 / 禁疗', () => {
   it('100% 禁疗：治疗效果归零（#166）', () => {
     const h = hero('A');
     h.baseStats = { ...h.baseStats, maxHp: 5000, currentHp: 1500 };
-    h.skills = [{
+    bind(h, {
       id: uid('s'), name: '治愈', type: 'active', active: { cooldownSeconds: 1, priority: 1, manaCost: 0 },
       segments: [{ kind: 'heal', delaySeconds: 0, basePower: 300, scaling: [] }],
-    }];
+    });
     const grievous: Talent = {
       id: uid('t'), name: '禁疗', description: '', type: 'triggered', heroId: null,
       trigger: { event: 'combat_start' },
