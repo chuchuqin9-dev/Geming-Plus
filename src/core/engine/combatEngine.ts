@@ -1211,11 +1211,11 @@ export class CombatEngine {
   // -------------------------------------------------------------- 公式
   private evalFormula(unit0: Unit, unit1: Unit, base: number, scaling: StatScaling[], _atMs: number, snap?: DamageSnapshot): number {
     let value = base || 0;
-    for (const s of scaling) value += this.resolveStat(unit0, unit1, s.stat, snap) * s.ratio;
+    for (const s of scaling) value += this.resolveStat(unit0, unit1, s.stat, snap, base) * s.ratio;
     return value;
   }
 
-  private resolveStat(source: Unit, target: Unit, stat: StatKey, snap?: DamageSnapshot): number {
+  private resolveStat(source: Unit, target: Unit, stat: StatKey, snap?: DamageSnapshot, rawBase = 0): number {
     const src = snap ? snap.source : source.combatant.stats;
     const tgt = snap ? snap.target : target.combatant.stats;
     switch (stat) {
@@ -1233,6 +1233,8 @@ export class CombatEngine {
       case 'targetLostHp': return tgt.maxHp - tgt.currentHp;
       case 'targetAttack': return tgt.attack;
       case 'targetAp': return tgt.ap;
+      // 原始伤害（#95）：引用当前效果段的基础数值（如基础伤害/基础治疗量），随原始伤害成长
+      case 'rawDamage': return rawBase || 0; 
       default: return 0;
     }
   }

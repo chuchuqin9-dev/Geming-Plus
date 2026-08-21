@@ -186,6 +186,17 @@ describe('战斗引擎：原始伤害（Raw Damage，见 #95）', () => {
     expect(ev.rawDamage).toBe(500);
     expect(ev.finalDamage).toBe(500);
   });
+
+  it('原始伤害可作为倍率属性来源：rawDamage 引用当前段基础伤害，随基础成长', () => {
+    // baseDamage=200，倍率 50% × 原始伤害(200) = +100，最终原始伤害应为 300
+    const h = hero('A');
+    h.skills = [{ ...skillOf({ cd: 1 }), name: '原始', segments: [rawSkill(200)] }];
+    h.skills[0].segments[0].scaling = [{ stat: 'rawDamage', ratio: 0.5 }];
+    const result = run({ heroes: [h], duration: 1 });
+    const ev = result.events.find((e: any) => e.eventType === 'damage' && e.damageType === 'raw');
+    expect(ev).toBeTruthy();
+    expect(ev.rawDamage).toBe(300);
+  });
 });
 
 describe('战斗引擎：天赋系统', () => {

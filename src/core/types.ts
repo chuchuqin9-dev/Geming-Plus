@@ -253,7 +253,9 @@ export type StatKey =
   | 'maxHp' | 'currentHp' | 'lostHp'
   | 'attack' | 'extraAttack' | 'ap' | 'armor' | 'magicResist' | 'moveSpeed'
   | 'targetMaxHp' | 'targetCurrentHp' | 'targetLostHp'
-  | 'targetAttack' | 'targetAp';
+  | 'targetAttack' | 'targetAp'
+  /** 原始伤害（Raw Damage）：当前效果段的基础伤害/基础数值，随原始伤害成长 */
+  | 'rawDamage';
 
 /** 公式中的一项：伤害 += 属性值 × ratio */
 export interface StatScaling {
