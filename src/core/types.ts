@@ -16,8 +16,19 @@ export const SCHEMA_VERSION = 3;
 // 基础枚举
 // ---------------------------------------------------------------------------
 
-/** 伤害类型 */
-export type DamageType = 'physical' | 'magic' | 'true';
+/**
+ * 伤害类型（见设计文档第 95 项）。
+ *
+ * 类型分类：
+ *  - raw      原始伤害 Raw Damage：未经过护甲/魔抗/穿透/减伤等防御计算之前的基础伤害数值。
+ *             用于技能基础伤害、装备基础伤害、计算公式展示与战斗日志记录。
+ *             伤害计算流程：原始伤害 → 根据伤害类型转换：
+ *               物理 → 计算护甲、穿透；魔法 → 计算魔抗、法穿；真实 → 无视抗性 → 最终伤害。
+ *  - physical 物理伤害：进入护甲/物穿结算
+ *  - magic    魔法伤害：进入魔抗/法穿结算
+ *  - true     真实伤害：无视抗性与减伤
+ */
+export type DamageType = 'raw' | 'physical' | 'magic' | 'true';
 
 /** 英雄类型 */
 export type HeroType = 'melee' | 'ranged';

@@ -161,6 +161,33 @@ describe('战斗引擎：真实伤害公式（固定值 + 属性倍率）', () =
   });
 });
 
+describe('战斗引擎：原始伤害（Raw Damage，见 #95）', () => {
+  const rawSkill = (baseDamage: number) => ({
+    kind: 'damage', delaySeconds: 0, baseDamage, scaling: [], damageType: 'raw' as const,
+    canCrit: false, critFamily: 'physical' as const, canLifesteal: false, canTriggerItems: false,
+    sourceKind: 'skill' as const, isSkillBoost: true, useMagicDamageBoost: true,
+  });
+
+  it('原始伤害 = 未经过护甲/减伤的基础数值，最终伤害与原始一致', () => {
+    const h = hero('A');
+    h.skills = [{ ...skillOf({ cd: 1 }), name: '原始', segments: [rawSkill(500)] }];
+    const result = run({ heroes: [h], duration: 2, dummyArmor: 1000, dummyMr: 0 });
+    const r = result.results.find((x) => x.id === 'A')!;
+    // 3 次 × 500 原始伤害：不随护甲/减伤结算，技能伤害桶应恰好 1500（普攻伤害计入其自身桶）
+    expect(r.damage.skill).toBe(1500);
+  });
+
+  it('日志区分原始伤害与最终伤害：rawDamage 与 finalDamage 相等且类型为 raw', () => {
+    const h = hero('A');
+    h.skills = [{ ...skillOf({ cd: 1 }), name: '原始', segments: [rawSkill(500)] }];
+    const result = run({ heroes: [h], duration: 1 });
+    const ev = result.events.find((e: any) => e.eventType === 'damage' && e.damageType === 'raw');
+    expect(ev).toBeTruthy();
+    expect(ev.rawDamage).toBe(500);
+    expect(ev.finalDamage).toBe(500);
+  });
+});
+
 describe('战斗引擎：天赋系统', () => {
   it('属性型天赋 攻击+20 → 攻击 100→120，普攻总伤提升', () => {
     const talent: Talent = {

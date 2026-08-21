@@ -23,6 +23,7 @@ const STAT_OPTIONS: Array<{ value: StatKey; label: string }> = [
 ];
 
 const DAMAGE_TYPES = [
+  { value: 'raw', label: '原始伤害' },
   { value: 'physical', label: '物理伤害' },
   { value: 'magic', label: '魔法伤害' },
   { value: 'true', label: '真实伤害' },

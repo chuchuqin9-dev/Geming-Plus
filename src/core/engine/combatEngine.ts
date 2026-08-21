@@ -225,7 +225,12 @@ function f(n: number): string {
   return String(Math.round(n * 100) / 100);
 }
 function damageTypeLabel(d: DamageType): string {
-  return d === 'physical' ? '物理' : d === 'magic' ? '魔法' : '真实';
+  switch (d) {
+    case 'raw': return '原始';
+    case 'physical': return '物理';
+    case 'magic': return '魔法';
+    default: return '真实';
+  }
 }
 function shieldTypeLabel(t: ShieldType): string {
   return t === 'physical' ? '物理' : t === 'magic' ? '魔法' : '全类型';
@@ -768,7 +773,7 @@ export class CombatEngine {
       this.refreshStateTags(target); // 刷新护盾状态标签供条件判断
     }
 
-    // 8) 穿透 + 抗性（真实伤害默认不计算护甲/魔抗/穿透）
+    // 8) 穿透 + 抗性（原始/真实伤害默认不计算护甲/魔抗/穿透）
     let finalResist = 0;
     let resistRate = 0;
     if (damageType === 'physical') {
@@ -778,16 +783,18 @@ export class CombatEngine {
       finalResist = finalMagicResist(tgt.magicResist, src.flatMagicPen, src.percentMagicPen);
       resistRate = finalResist * 0.06 / (1 + finalResist * 0.06);
     }
-    let afterResist = damageType === 'true' ? raw : raw * (1 - resistRate);
+    const rawBypasses = damageType === 'raw' || damageType === 'true';
+    let afterResist = rawBypasses ? raw : raw * (1 - resistRate);
 
-    // 9) 伤害减免（受伤害方视角）
-    if (damageType !== 'true' || !this.config.trueDamageIgnoresReduction) {
+    // 9) 伤害减免（原始/真实伤害根据配置无视；原始伤害恒无视减伤）
+    const skipReduction = damageType === 'raw' || (damageType === 'true' && this.config.trueDamageIgnoresReduction);
+    if (!skipReduction) {
       afterResist *= 1 - clampPercent(tgt.damageReduction);
     }
 
-    // 10) 护盾吸收（真实伤害是否可吸收由 trueDamageAffectsShield 决定）
+    // 10) 护盾吸收（原始伤害为未结算基础，默认不吸收；真实伤害是否可吸收由 trueDamageAffectsShield 决定）
     let absorbed = 0;
-    if (afterResist > 0 && (damageType !== 'true' || this.config.trueDamageAffectsShield)) {
+    if (afterResist > 0 && damageType !== 'raw' && (damageType !== 'true' || this.config.trueDamageAffectsShield)) {
       absorbed = this.absorbIntoShields(atMs, target, damageType, afterResist);
       afterResist -= absorbed;
       if (absorbed > 0) {
@@ -816,7 +823,7 @@ export class CombatEngine {
       damageType, rawDamage: raw, crit, finalDamage: appliedLoss, absorbedByShield: absorbed,
       targetRemainingHp: target.combatant.hp,
       rootEventId: chain?.rootEventId, parentEventId: this.events.length, sourceEffectId: chain ? chain.path[chain.path.length - 1] : undefined, triggerDepth: chain?.depth,
-      description: `${source.combatant.label}${crit ? ' 暴击！' : ''} 造成${damageTypeLabel(damageType)}伤害 ${f(appliedLoss)}（原伤害 ${f(raw)}）`,
+      description: `${source.combatant.label}${crit ? ' 暴击！' : ''} 造成【原始伤害 ${f(raw)} → ${damageTypeLabel(damageType)} ${f(appliedLoss)}最终伤害】${absorbed > 0 ? `（护盾吸收 ${f(absorbed)}）` : ''}`,
       details: { finalResist, reductionRate: resistRate },
     });
 
