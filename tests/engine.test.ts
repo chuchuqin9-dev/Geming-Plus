@@ -4,6 +4,7 @@ import {
   emptyStats,
 } from '../src/core/types';
 import { runCombat } from '../src/core/engine/combatEngine';
+import { computeEffectiveAttackInterval, resolveMinAttackInterval } from '../src/core/engine/attackSpeed';
 import { buildCombatConfig } from '../src/core/combatConfig';
 import { uid } from '../src/core/defaults';
 
@@ -214,5 +215,168 @@ describe('战斗引擎：护盾系统', () => {
     expect(ra.defense.allShieldAbsorbed).toBe(0);
     expect(ra.defense.trueTaken).toBe(200);
     expect(ra.finalHp).toBe(4800);
+  });
+});
+
+// =========================================================================
+// #178 机制验收测试：攻速上限 / 攻速 Buff / 距离与生命增伤 / 伤害前护盾 / 防递归
+// =========================================================================
+
+function trueSeg(baseDamage: number): any {
+  return {
+    kind: 'damage', delaySeconds: 0, baseDamage, scaling: [], damageType: 'true',
+    canCrit: false, critFamily: 'physical', canLifesteal: true, canTriggerItems: true,
+    sourceKind: 'skill', isSkillBoost: true, useMagicDamageBoost: true,
+  };
+}
+
+function attackTimes(result: ReturnType<typeof run>, id: string): number[] {
+  return result.events.filter((e) => e.eventType === 'attack' && e.sourceId === id).map((e) => e.timestampMs);
+}
+
+describe('#178 攻速上限与解析器（#131-133）', () => {
+  it('基础攻速值 1500 → 最低攻击间隔 0.42', () => {
+    expect(resolveMinAttackInterval(1500)).toBeCloseTo(0.42, 2);
+  });
+
+  it('没有突破：理论 0.30，但最终仍为最低攻击间隔 0.42', () => {
+    const stats: HeroStats = { ...emptyStats(), attackInterval: 0.30, baseAttackSpeed: 1500 };
+    const r = computeEffectiveAttackInterval(stats, undefined as any);
+    expect(r.theoreticalInterval).toBeCloseTo(0.30, 2);
+    expect(r.minInterval).toBeCloseTo(0.42, 2);
+    expect(r.capped).toBe(true);
+    expect(r.final).toBeCloseTo(0.42, 2);
+  });
+
+  it('有突破（独立规则）：最低 0.42→0.33，理论 0.30，最终 0.33', () => {
+    // 突破按配置/规则表独立降低最低攻击间隔（#133），非简单 0.42÷1.6
+    const stats: HeroStats = { ...emptyStats(), attackInterval: 0.30, baseAttackSpeed: 1500, attackCapBreakthrough: 21.4 };
+    const r = computeEffectiveAttackInterval(stats, undefined as any);
+    expect(r.minInterval).toBeCloseTo(0.33, 2); // 0.42 × (1 - 0.214) ≈ 0.33
+    expect(r.final).toBeCloseTo(0.33, 2); // 理论 0.30 < 突破后最低 0.33，被限制到 0.33
+  });
+});
+
+describe('#178 攻速 Buff 叠层与次数（#135-137/#140/#164）', () => {
+  it('攻速 Buff 最多 5 层，第 6 次触发也不超过 5 层', () => {
+    const h = hero('A');
+    const stackTalent: Talent = {
+      id: uid('t'), name: '攻速叠层', description: '', type: 'triggered', heroId: null,
+      trigger: { event: 'basic_attack_hit' },
+      effects: [{ kind: 'buff', delaySeconds: 0, target: 'self', buffType: 'attack_speed', value: 10, durationSeconds: 100, maxStacks: 5, refreshMode: 'overall' }],
+    };
+    const result = run({ heroes: [h], talentsA: [stackTalent], duration: 8 });
+    const ra = result.results.find((x) => x.id === 'A')!;
+    expect(ra.buffs.maxAttackSpeedStacks).toBe(5); // 峰值封顶 5
+    expect(ra.buffs.attackSpeedStacksAtEnd).toBe(5); // 结束仍 5 层
+  });
+
+  it('前 3 次普通攻击加速（每次消耗一次），第 4 次起恢复原速', () => {
+    const h = hero('A');
+    const first3: Talent = {
+      id: uid('t'), name: '开局疾速', description: '', type: 'triggered', heroId: null,
+      trigger: { event: 'combat_start' },
+      effects: [{ kind: 'buff', delaySeconds: 0, target: 'self', buffType: 'attack_speed', value: 100, durationSeconds: 0, maxStacks: 1, refreshMode: 'overall', expiresOnUse: true, maxUses: 3 }],
+    };
+    const result = run({ heroes: [h], talentsA: [first3], duration: 5 });
+    const ra = result.results.find((x) => x.id === 'A')!;
+    expect(ra.buffs.attackSpeedStacksAtEnd).toBe(0); // 3 次用尽，效果移除
+    const t = attackTimes(result, 'A');
+    expect(t.length).toBeGreaterThan(3);
+    // 前 3 个攻击间隔被 +100% 攻速压到 ~0.5s；第 4 个间隔恢复到基础 1.0s
+    expect(t[1] - t[0]).toBeCloseTo(500, -1);
+    expect(t[2] - t[1]).toBeCloseTo(500, -1);
+    expect(t[3] - t[2]).toBeCloseTo(500, -1);
+    expect(t[4] - t[3]).toBeGreaterThan(900);
+  });
+});
+
+describe('#178 伤害前护盾 / 距离伤害 / 生命阶梯增伤', () => {
+  it('伤害前(BEFORE_DAMAGE)生成 300 护盾：受 500 伤 → 生命只扣 200', () => {
+    const a = hero('A', { attack: 500, armor: 0 });
+    const b = hero('B', { attack: 0, armor: 0, maxHp: 5000, currentHp: 5000 });
+    const shieldBeforeDamage: Talent = {
+      id: uid('t'), name: '预动护盾', description: '', type: 'triggered', heroId: null,
+      trigger: { event: 'before_damage' },
+      effects: [{ kind: 'shield', delaySeconds: 0, basePower: 300, scaling: [], durationSeconds: 0, shieldType: 'all', refresh: 'stack', priority: 0 }],
+    };
+    const result = run({ heroes: [a, b], talentsB: [shieldBeforeDamage], duration: 0.9 });
+    const rb = result.results.find((x) => x.id === 'B')!;
+    expect(rb.defense.shieldGenerated).toBe(300);
+    expect(rb.defense.damageTaken).toBe(200);
+    expect(rb.finalHp).toBe(5000 - 200);
+  });
+
+  it('距离伤害达到上限后不再增加', () => {
+    const h = hero('A');
+    const mk = (travel: number) => ({
+      id: uid('s'), name: '远程', type: 'active' as const,
+      active: { cooldownSeconds: 100, priority: 1, manaCost: 0 },
+      segments: [{
+        ...trueSeg(500), travelDistance: travel,
+        distanceScaling: { minDistance: 100, maxDistance: 400, perDistancePerUnit: 1, maxBonusDamage: 200 } as any,
+      }],
+    });
+    // 200 距离 = 超最小距离 100 → 额外 +100；上限 maxBonusDamage=200
+    const near = hero('A'); near.skills = [mk(200)];
+    const nearRes = run({ heroes: [near], duration: 1 }).results.find((x) => x.id === 'A')!;
+    expect(nearRes.damage.skill).toBe(600); // 500 + 100
+    // 超过最大距离 400 → 封顶 200，不再随距离增长
+    const far = hero('A'); far.skills = [mk(100000)];
+    const farRes = run({ heroes: [far], duration: 1 }).results.find((x) => x.id === 'A')!;
+    expect(farRes.damage.skill).toBe(700); // 500 + 200（封顶）
+  });
+
+  it('生命值阶梯增伤达到上限后封顶', () => {
+    const h = hero('A');
+    h.skills = [{
+      id: uid('s'), name: '斩', type: 'active',
+      active: { cooldownSeconds: 100, priority: 1, manaCost: 0 },
+      segments: [{
+        ...trueSeg(300),
+        hpBonus: { stat: 'targetMaxHp', op: '>=', value: 2000, bonusPercent: 10, perUnit: 500, perBonusPercent: 5, maxBonusPercent: 30 } as any,
+      }],
+    }];
+    // 木桩 maxHp 100000 ≥ 2000，基础 10% + 阶梯远超，但封顶 30%
+    const r = run({ heroes: [h], duration: 1 }).results.find((x) => x.id === 'A')!;
+    expect(r.damage.skill).toBe(300 * 1.30);
+  });
+});
+
+describe('#178 防无限触发 / 禁疗', () => {
+  it('装备A触天赋B、天赋B触装备A：触发链深度受限不无限递归', () => {
+    const h = hero('A', { attack: 10 });
+    const talentB: Talent = {
+      id: uid('t'), name: '连锁', description: '', type: 'triggered', heroId: null,
+      trigger: { event: 'damage_dealt' },
+      effects: [trueSeg(5)],
+    };
+    const itemA: Equipment = {
+      id: 'loopA', name: '回响', favorite: false, tags: [], stats: {},
+      effects: [{ id: 'loopA-e', name: '回响', trigger: { kind: 'on_damage_dealt' }, segments: [trueSeg(4)] }],
+    };
+    const result = run({ heroes: [h], items: [itemA], itemsA: ['loopA'], talentsA: [talentB], duration: 1 });
+    const procs = result.events.filter((e) => e.eventType === 'item_proc' && e.itemId === 'loopA').length;
+    expect(result.events.length).toBeLessThan(500); // 链条有界，未无限循环
+    expect(procs).toBeGreaterThanOrEqual(1); // 确曾发生连锁
+    expect(procs).toBeLessThanOrEqual(10); // 深度受限
+  });
+
+  it('100% 禁疗：治疗效果归零（#166）', () => {
+    const h = hero('A');
+    h.baseStats = { ...h.baseStats, maxHp: 5000, currentHp: 1500 };
+    h.skills = [{
+      id: uid('s'), name: '治愈', type: 'active', active: { cooldownSeconds: 1, priority: 1, manaCost: 0 },
+      segments: [{ kind: 'heal', delaySeconds: 0, basePower: 300, scaling: [] }],
+    }];
+    const grievous: Talent = {
+      id: uid('t'), name: '禁疗', description: '', type: 'triggered', heroId: null,
+      trigger: { event: 'combat_start' },
+      effects: [{ kind: 'buff', delaySeconds: 0, target: 'self', buffType: 'grievous', value: 100, durationSeconds: 100, maxStacks: 1, refreshMode: 'overall' }],
+    };
+    const result = run({ heroes: [h], talentsA: [grievous], duration: 1 });
+    const ra = result.results.find((x) => x.id === 'A')!;
+    expect(ra.finalHp).toBe(1500); // 300 治疗被 100% 禁疗抵消
+    expect(ra.lifesteal.totalHealing).toBe(0);
   });
 });

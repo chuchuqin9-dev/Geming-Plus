@@ -11,12 +11,14 @@
  */
 import {
   type CombatConfig, type CombatEvent, type CombatResult, type CombatSnapshot,
-  type CombatantId, type CooldownReduceSegment, type DamageSegment,
+  type CombatantId, type CombatantRuntimeState, type CooldownReduceSegment, type DamageSegment,
   type DamageSourceKind, type DamageType, type DotSegment, type EffectSegment,
   type Equipment, type EquipmentEffect, type EquipmentTrigger, type EventType,
   type PassiveTrigger, type RuntimeCombatant, type HeroStats, type ShieldInstance,
-  type ShieldSegment, type ShieldType, type Skill, type StatKey, type StatScaling,
-  type Talent, type TalentType, type TriggerEvent,
+  type ShieldSegment, type ShieldType, type Skill, type StatKey, type StatScaling, type StateTag,
+  type Talent, type TalentType, type TriggerConditionKind, type TriggerEvent, type BuffType,
+  type BuffSegment, type OnHitDamageSegment, type DamageTag, type CritFamily,
+  type DamageDistanceScaling, type DamageHpBonus, type BuffCategory,
   BASIC_ATTACK_SKILL_MARKER,
 } from '../types';
 import { clampPercent } from '../formulas/cooldown';
@@ -25,8 +27,69 @@ import { resolveCrit } from '../formulas/crit';
 import { finalArmor, finalMagicResist } from '../formulas/penetration';
 import { buildDummyCombatant, buildHeroCombatant, clampHp } from './stats';
 import { uid } from '../defaults';
+import { computeEffectiveAttackInterval } from './attackSpeed';
+import { applyBuff, buffStacks, buffTotal, hasControlImmunity, removeBuff, sweepExpired } from './buffs';
 
 const SAMPLE_MS = 250;
+
+/** 触发链最大深度（见 #161）：超过后终止继续触发并记录调试日志 */
+const MAX_TRIGGER_DEPTH = 8;
+/** 默认禁止效果通过自己产生的事件反复触发自己（见 #161） */
+const ALLOW_SELF_TRIGGER = false;
+
+/** 伤害结算的附加选项（见 #154-158）：附加伤害独立实例的各项开关 */
+interface DamageOptions {
+  /** 是否为独立结算的附加伤害实例（On-hit，见 #154） */
+  independent?: boolean;
+  /** 附加伤害标签（见 #157），写进事件供链式校验 */
+  tags?: DamageTag[];
+  /** 是否允许暴击（独立于角色暴击属性，见 #156） */
+  allowCrit?: boolean;
+  /** 暴击归属（物理/魔法暴击体系，见 #156） */
+  critFamily?: CritFamily;
+  /** 独立暴击倍率（覆盖角色暴击伤害，见 #156） */
+  critDamageOverride?: number;
+  /** 独立暴击率（0-100，覆盖角色暴击率，见 #156） */
+  critChanceOverride?: number;
+  /** 是否触发吸血（见 #158） */
+  canLifesteal?: boolean;
+  /** 允许全能吸血（见 #158） */
+  useAllVamp?: boolean;
+  /** 是否触发装备（见 #158） */
+  triggerEquip?: boolean;
+  /** 是否触发天赋/被动/其他 On-hit（见 #158） */
+  triggerTalent?: boolean;
+  triggerPassive?: boolean;
+  triggerOnHit?: boolean;
+}
+
+/**
+ * 触发来源链（见 #159-161）：追踪「这个效果由什么事件触发」。
+ * rootEventId 根事件；depth 触发深度；path 记录已执行的效果键，用于防自触发/防递归。
+ */
+interface TriggerChain {
+  rootEventId: number;
+  depth: number;
+  path: string[];
+}
+
+/** 属性快照（#152）：效果生成时冻结的双方属性 */
+interface DamageSnapshot {
+  source: HeroStats;
+  target: HeroStats;
+}
+
+/** 距离/生命条件中通用的比较结果 */
+function cmp(a: number, op: '>' | '>=' | '<' | '<=' | 'between', value: number, value2?: number): boolean {
+  switch (op) {
+    case '>': return a > value;
+    case '>=': return a >= value;
+    case '<': return a < value;
+    case '<=': return a <= value;
+    case 'between': return a >= value && a <= (value2 ?? value);
+    default: return false;
+  }
+}
 
 /** 最小堆（按 timeMs 优先，其次 seq） */
 class MinHeap<T> {
@@ -88,6 +151,19 @@ function buildBasicAttackSegment(stats: HeroStats): DamageSegment {
   };
 }
 
+/** 新建运行时状态（见 #176）：战斗中的临时改造全部集中于此 */
+function makeRuntimeState(id: CombatantId): CombatantRuntimeState {
+  return {
+    buffs: [],
+    counters: new Map<string, number>(),
+    stateTags: new Set<StateTag>(),
+    attackSequence: 0,
+    consecutive: { current: 0, lastAttackTimeMs: -1, allowedGapMs: 1500, isAttacking: false },
+    tempAttackSpeed: 0,
+    tempCapBreakthrough: 0,
+  };
+}
+
 interface UnitHero {
   skills: Skill[];
   items: Equipment[];
@@ -97,6 +173,8 @@ interface UnitHero {
   skillCds: Map<string, number>;
   /** 装备效果/被动技能/天赋内部冷却就绪时间 */
   procCds: Map<string, number>;
+  /** 运行时状态（见 #176）：Buff/计数器/状态标签/攻速叠层等，与模板分离 */
+  runtime: CombatantRuntimeState;
 }
 
 interface Unit {
@@ -122,6 +200,7 @@ interface RunAccum {
   };
   skills: Map<string, { id: string; name: string; cast: number; hits: number; dmg: number; crits: number; heal: number; shield: number }>;
   items: Map<string, { id: string; name: string; procs: number; dmg: number; heal: number; shield: number; times: number[] }>;
+  buffs: { gained: number; expired: number; activeAtEnd: number; maxAttackSpeedStacks: number; attackSpeedStacksAtEnd: number };
 }
 
 interface SegmentMeta {
@@ -151,6 +230,19 @@ function damageTypeLabel(d: DamageType): string {
 function shieldTypeLabel(t: ShieldType): string {
   return t === 'physical' ? '物理' : t === 'magic' ? '魔法' : '全类型';
 }
+function buffTypeLabel(t: BuffType): string {
+  switch (t) {
+    case 'attack_speed': return '攻速提升';
+    case 'slow': return '减速';
+    case 'grievous': return '禁疗';
+    case 'damage_bonus': return '增伤';
+    case 'vulnerable': return '易伤';
+    case 'control_immune': return '控制免疫';
+    case 'attack_cap_break': return '攻速上限突破';
+    case 'lifesteal_boost': return '吸血提升';
+    default: return t;
+  }
+}
 
 export class CombatEngine {
   private config: CombatConfig;
@@ -169,6 +261,10 @@ export class CombatEngine {
   private damageCurve: Array<{ tMs: number; cumulativeDamage: number; sourceId: CombatantId }> = [];
   private hpCurve: Array<{ tMs: number; A: number; B: number }> = [];
   private cumDmgById = new Map<CombatantId, number>();
+  /** 触发链超深被截断的次数（见 #161），供调试日志统计 */
+  private cappedTriggers = 0;
+  /** 因 allowSelfTrigger=false 被拦截的自触发次数（见 #161） */
+  private selfBlockedTriggers = 0;
 
   constructor(config: CombatConfig, equipmentById: Map<string, Equipment>) {
     this.config = config;
@@ -216,6 +312,7 @@ export class CombatEngine {
           basicAttack: buildBasicAttackSegment(combatant.stats),
           skillCds: new Map(),
           procCds: new Map(),
+          runtime: makeRuntimeState(id),
         },
       });
       this.accum.set(id, this.emptyAccum());
@@ -236,6 +333,7 @@ export class CombatEngine {
       defense: { damageTaken: 0, physicalTaken: 0, magicTaken: 0, trueTaken: 0, shieldAbsorbed: 0, shieldGenerated: 0, shieldsGained: 0, shieldTotal: 0, shieldMaxSingle: 0, physicalShieldAbsorbed: 0, magicShieldAbsorbed: 0, allShieldAbsorbed: 0, shieldBroken: 0, shieldExpired: 0 },
       skills: new Map(),
       items: new Map(),
+      buffs: { gained: 0, expired: 0, activeAtEnd: 0, maxAttackSpeedStacks: 0, attackSpeedStacksAtEnd: 0 },
     };
   }
 
@@ -290,6 +388,97 @@ export class CombatEngine {
     return clampPercent(unit.combatant.stats.cooldownReduction);
   }
 
+  // ----------------------------------------------------------- Counter / 状态标签
+  private runtimeOf(unit: Unit): CombatantRuntimeState {
+    if (!unit.hero) throw new Error('非英雄实体无运行时状态');
+    return unit.hero.runtime;
+  }
+
+  private incCounter(unit: Unit, key: string, by = 1): number {
+    const r = this.runtimeOf(unit);
+    const next = (r.counters.get(key) ?? 0) + by;
+    r.counters.set(key, next);
+    return next;
+  }
+
+  private setStateTag(unit: Unit, tag: StateTag, present: boolean): void {
+    const r = this.runtimeOf(unit);
+    if (present) r.stateTags.add(tag);
+    else r.stateTags.delete(tag);
+  }
+
+  /** 刷新自动维护的 State Tag（见 #171）：护盾存在、连续攻击等 */
+  private refreshStateTags(unit: Unit): void {
+    if (!unit.hero) return;
+    const c = unit.combatant;
+    const has = (t: ShieldType) => c.shields.some((s) => s.type === t);
+    this.setStateTag(unit, 'HAS_SHIELD', c.shields.length > 0);
+    this.setStateTag(unit, 'HAS_PHYSICAL_SHIELD', has('physical'));
+    this.setStateTag(unit, 'HAS_MAGIC_SHIELD', has('magic'));
+    this.setStateTag(unit, 'HAS_ALL_SHIELD', has('all'));
+  }
+
+  /**
+   * 施加一段 buff 效果（#134/#162）。攻速/突破会体现在 temp 累计上，不写回 stats（#176）。
+   */
+  private applyBuffSegment(atMs: number, source: Unit, target: Unit, seg: BuffSegment, meta: SegmentMeta): void {
+    const owner = seg.target === 'self' ? source : target;
+    if (!owner.hero) return;
+    const r = this.runtimeOf(owner);
+    const sourceLabel = meta.skillName || meta.itemName || meta.talentName || '效果';
+    const totalBefore = buffTotal(r, seg.buffType, seg.category);
+
+    const inst = applyBuff(r, {
+      source: sourceLabel,
+      buffType: seg.buffType,
+      value: seg.value,
+      category: seg.category,
+      durationSeconds: seg.durationSeconds,
+      maxStacks: seg.maxStacks,
+      refreshMode: seg.refreshMode,
+      stackDurationSeconds: seg.stackDurationSeconds,
+      expiresOnUse: seg.expiresOnUse,
+      maxUses: seg.maxUses,
+      controlTypes: seg.controlTypes,
+    }, atMs);
+    if (!inst) return;
+
+    this.recomputeTempBuffs(r); // 攻速/突破体现在 temp 上，不写回 stats（#176）
+
+    const totalAfter = buffTotal(r, seg.buffType, seg.category);
+    const action = inst.stacks > 1 ? 'stack' : totalAfter > totalBefore ? 'created' : 'refreshed';
+
+    this.emit('buff', owner.id, owner.id, {
+      buffType: seg.buffType, buffStacks: inst.stacks,
+      buffAction: action,
+      description: `${owner.combatant.label}${action === 'created' ? '获得' : action === 'stack' ? '叠层' : '刷新'}「${buffTypeLabel(seg.buffType)}」${inst.stacks > 1 ? `×${inst.stacks}` : ''}${seg.durationSeconds > 0 ? `（${seg.durationSeconds}s）` : ''}`,
+      debug: this.debugInfo(owner),
+    });
+
+    this.accBuff(owner, true);
+  }
+
+  /** 采集调试日志字段（见 #177） */
+  private debugInfo(unit: Unit): CombatEvent['debug'] {
+    if (!unit.hero) return undefined;
+    const stats = unit.combatant.stats;
+    const r = this.runtimeOf(unit);
+    const as = computeEffectiveAttackInterval(stats, r);
+    const counters: Record<string, number> = {};
+    r.counters.forEach((v, k) => { counters[k] = v; });
+    return {
+      attackSpeed: stats.attackSpeedBonus + r.tempAttackSpeed,
+      theoreticalInterval: as.theoreticalInterval,
+      minInterval: as.minInterval,
+      capBroken: !as.capped,
+      attackSpeedStacks: buffStacks(r, 'attack_speed'),
+      buffs: r.buffs.map((b) => `${b.buffType}×${b.stacks}`),
+      shields: this.totalShield(unit.combatant),
+      counters,
+      stateTags: [...r.stateTags],
+    };
+  }
+
   private checkEnd(): void {
     if (this.ended) return;
     const heroes = [...this.units.values()].filter((u) => !!u.hero);
@@ -327,16 +516,71 @@ export class CombatEngine {
   // --------------------------------------------------------------- 普攻
   private autoAttack(unit: Unit, atMs: number): void {
     if (!unit.combatant.alive) return;
+    this.sweepUnitBuffs(unit, atMs);           // 过期攻速/突破 Buff 实时回收
     const target = this.enemyOf(unit.id);
     if (!target || !target.combatant.alive) return;
-    this.applySegment(atMs, unit, target, unit.hero!.basicAttack, {
+    const hero = unit.hero!;
+    const r = this.runtimeOf(unit);
+
+    // 计数器 / 攻击序号 / 连续攻击（#138 / #139 / #141）
+    const n = ++r.attackSequence;
+    this.incCounter(unit, 'basic_attack_total');
+    const gapMs = (r.consecutive.lastAttackTimeMs < 0) ? 0 : (atMs - r.consecutive.lastAttackTimeMs);
+    r.consecutive.current = (gapMs > r.consecutive.allowedGapMs) ? 1 : r.consecutive.current + 1;
+    r.consecutive.lastAttackTimeMs = atMs;
+    r.counters.set('consecutive_attacks', r.consecutive.current);
+    this.setStateTag(unit, 'IS_CONSECUTIVE_ATTACKING', r.consecutive.current >= 2);
+    this.setStateTag(unit, 'HAS_ATTACKED', true);
+
+    this.emit('attack', unit.id, target.id, { description: `Attack #${n}` });
+
+    this.applySegment(atMs, unit, target, hero.basicAttack, {
       sourceKind: 'basic_attack', sourceType: 'basic_attack',
       skillId: BASIC_ATTACK_SKILL_MARKER, skillName: '普通攻击',
     });
     this.fireTriggers(unit, 'basic_attack_hit', atMs, {});
     this.fireTriggers(unit, 'on_attack', atMs, {}); // 兼容旧枚举：攻击时
-    const next = atMs + Math.max(1, unit.combatant.stats.attackInterval * 1000);
-    this.schedule(next, () => this.autoAttack(unit, next));
+
+    // 攻速上限解析（#131-133）：最终间隔受最低间隔约束，攻速来自 buff（#134）且不写回模板
+    const interval = computeEffectiveAttackInterval(unit.combatant.stats, r);
+    const nextMs = atMs + Math.round(interval.final * 1000);
+    this.schedule(Math.max(atMs + 1, nextMs), () => this.autoAttack(unit, nextMs));
+    // 消耗「前N次攻击」类攻速 Buff 的可用次数（#137/#140），下一击起不再计入
+    this.consumeOnUseAttackBuffs(unit);
+  }
+
+  /** 对 expiresOnUse 攻速类 Buff 每次攻击消耗一次，用尽后移除（#137/#140） */
+  private consumeOnUseAttackBuffs(unit: Unit): void {
+    const r = this.runtimeOf(unit);
+    const consumed = new Set<string>();
+    for (const b of r.buffs) {
+      if (!b.expiresOnUse) continue;
+      b.uses = (b.uses ?? 1) - 1;
+      if ((b.uses ?? 0) <= 0) consumed.add(b.id);
+    }
+    for (const id of consumed) removeBuff(r, id, 'consumed');
+    if (consumed.size) {
+      this.emit('buff', unit.id, unit.id, {
+        buffAction: 'consumed',
+        description: `${unit.combatant.label}的攻速效果使用次数耗尽`,
+      });
+    }
+    this.recomputeTempBuffs(r);
+  }
+
+  /** 重算临时攻速/突破：expiresOnUse 且次数耗尽者不计入 */
+  private recomputeTempBuffs(r: CombatantRuntimeState): void {
+    const sum = (type: BuffType) => {
+      let s = 0;
+      for (const b of r.buffs) {
+        if (b.buffType !== type) continue;
+        if (b.expiresOnUse && (b.uses ?? 1) <= 0) continue;
+        s += b.value;
+      }
+      return s;
+    };
+    r.tempAttackSpeed = sum('attack_speed');
+    r.tempCapBreakthrough = sum('attack_cap_break');
   }
 
   // --------------------------------------------------------------- 技能
@@ -383,29 +627,35 @@ export class CombatEngine {
 
   // -------------------------------------------------------------- 片段
   private scheduleSegment(
-    baseMs: number, source: Unit, target: Unit, seg: EffectSegment, meta: SegmentMeta,
+    baseMs: number, source: Unit, target: Unit, seg: EffectSegment, meta: SegmentMeta, chain?: TriggerChain,
   ): void {
     const at = baseMs + Math.round((seg.delaySeconds || 0) * 1000);
-    if (at === baseMs) {
-      this.applySegment(at, source, target, seg, meta);
-      return;
+    // 属性快照（#152）：snapshot=用「效果生成时」的属性（在调度/释放节点冻结双方属性）
+    let snap: DamageSnapshot | undefined;
+    if (seg.kind === 'damage' && seg.snapshot === 'snapshot') {
+      snap = { source: { ...source.combatant.stats }, target: { ...target.combatant.stats } };
+    } else if (seg.kind === 'dot' && seg.snapshot === 'snapshot') {
+      snap = { source: { ...source.combatant.stats }, target: { ...target.combatant.stats } };
     }
-    this.schedule(at, () => this.applySegment(at, source, target, seg, meta));
+    const run = () => this.applySegment(at, source, target, seg, meta, snap, chain);
+    if (at === baseMs) run();
+    else this.schedule(at, run);
   }
 
   private applySegment(
     atMs: number, source: Unit, target: Unit, seg: EffectSegment, meta: SegmentMeta,
+    snap?: DamageSnapshot, chain?: TriggerChain,
   ): void {
     if (!source.combatant.alive) return;
     switch (seg.kind) {
       case 'damage':
-        this.dealDamage(atMs, source, target, seg, meta);
+        this.dealDamage(atMs, source, target, seg, meta, undefined, snap, chain);
         break;
       case 'dot':
-        this.scheduleDot(atMs, source, target, seg, meta);
+        this.scheduleDot(atMs, source, target, seg, meta, snap, chain);
         break;
       case 'heal': {
-        const amount = this.evalFormula(source, target, seg.basePower, seg.scaling, atMs);
+        const amount = this.evalFormula(source, target, seg.basePower, seg.scaling, atMs, snap);
         this.healCombatant(atMs, source.combatant, amount, source, `${seg.basePower} 治疗量`, meta);
         break;
       }
@@ -416,11 +666,32 @@ export class CombatEngine {
       case 'cooldown_reduce':
         this.reduceCooldowns(atMs, source, seg, meta);
         break;
+      case 'buff':
+        this.applyBuffSegment(atMs, source, target, seg, meta);
+        break;
+      case 'on_hit_damage':
+        this.applyOnHitDamage(atMs, source, target, seg, meta, chain);
+        break;
     }
+  }
+
+  /** 附加伤害：独立 Damage Instance（#153-158），各自经历护甲/魔抗/暴击/吸血/增伤/减伤 */
+  private applyOnHitDamage(atMs: number, source: Unit, target: Unit, seg: OnHitDamageSegment, meta: SegmentMeta, chain?: TriggerChain): void {
+    this.dealDamage(atMs, source, target, seg, {
+      ...meta, sourceKind: meta.sourceKind, sourceType: meta.sourceType,
+    }, {
+      independent: true, tags: seg.tags, allowCrit: seg.canCrit, critFamily: seg.critFamily,
+      critDamageOverride: seg.critDamageOverride, critChanceOverride: seg.critChanceOverride,
+      canLifesteal: seg.canPhysicalLifesteal || seg.canMagicLifesteal || seg.canAllVamp,
+      useAllVamp: seg.canAllVamp,
+      triggerEquip: seg.canTriggerEquip, triggerTalent: seg.canTriggerTalent,
+      triggerPassive: seg.canTriggerPassive, triggerOnHit: seg.canTriggerOnHit,
+    }, undefined, chain);
   }
 
   private scheduleDot(
     baseMs: number, source: Unit, target: Unit, seg: DotSegment, meta: SegmentMeta,
+    snap?: DamageSnapshot, chain?: TriggerChain,
   ): void {
     const firstRelMs = Math.round((seg.delaySeconds || 0) * 1000);
     const tickMs = Math.max(1, seg.tickSeconds * 1000);
@@ -428,24 +699,45 @@ export class CombatEngine {
     const tickCount = totalMs > 0 ? Math.floor(totalMs / tickMs) : 0;
     for (let i = 0; i <= tickCount; i++) {
       const at = baseMs + firstRelMs + i * tickMs;
-      this.schedule(at, () => this.dealDamage(at, source, target, seg, { ...meta, sourceKind: 'dot', sourceType: 'dot' }));
+      this.schedule(at, () => this.dealDamage(at, source, target, seg, { ...meta, sourceKind: 'dot', sourceType: 'dot' }, undefined, snap, chain));
     }
   }
 
   // -------------------------------------------------------------- 伤害流水线
   private dealDamage(
-    atMs: number, source: Unit, target: Unit, seg: DamageSegment | DotSegment, meta: SegmentMeta,
+    atMs: number, source: Unit, target: Unit, seg: DamageSegment | DotSegment | OnHitDamageSegment, meta: SegmentMeta,
+    opt: DamageOptions = {}, snap?: DamageSnapshot, chain?: TriggerChain,
   ): void {
-    const base = seg.kind === 'damage' ? seg.baseDamage : seg.baseDamagePerTick;
+    const base = seg.kind === 'dot' ? seg.baseDamagePerTick : seg.baseDamage;
     const scaling: StatScaling[] = seg.scaling || [];
     const damageType: DamageType = seg.damageType;
-    const src = source.combatant.stats;
-    const tgt = target.combatant.stats;
+    // 属性快照（#152）：snapshot 模式下用冻结属性，否则用实时属性
+    const src = snap ? snap.source : source.combatant.stats;
+    const tgt = snap ? snap.target : target.combatant.stats;
+    const sourceKind = meta.sourceKind;
 
     // 1) 原始伤害
-    let raw = this.evalFormula(source, target, base, scaling, atMs);
+    let raw = this.evalFormula(source, target, base, scaling, atMs, snap);
 
-    // 2) 增伤
+    // 2) 距离伤害（#146-148）：随投射物实际飞行距离增加，封顶
+    if (seg.kind === 'damage' && seg.distanceScaling) {
+      const d = this.distanceFor(seg);
+      const db = this.distanceBonus(seg.distanceScaling, d);
+      raw += db.add;
+      if (db.addMul) raw *= 1 + db.addMul;
+    }
+
+    // 3) 生命值相关增伤（#149-151）：满足条件增伤、阶梯递增并封顶
+    if (seg.kind === 'damage' && seg.hpBonus) {
+      const bonus = this.hpBonusPercent(seg.hpBonus, src, tgt);
+      if (bonus > 0) raw *= 1 + bonus / 100;
+    }
+
+    // 4) 增伤(自身愿意) / 易伤(目标愿意) Buff（#167-169），分类独立计算
+    raw *= this.buffDamageMultiplier(source, damageType, sourceKind);
+    raw *= this.buffVulnerableMultiplier(target, damageType, sourceKind);
+
+    // 5) 常规增伤：普攻/技能/法强加成
     if (seg.kind === 'damage' && seg.isBasicAttackBoost) raw *= 1 + clampPercent(src.attackDamage);
     if (seg.kind === 'damage' && seg.isSkillBoost) {
       raw *= 1 + clampPercent(damageType === 'physical' ? src.physicalSkillDamage : src.magicDamage);
@@ -454,18 +746,29 @@ export class CombatEngine {
       raw *= 1 + clampPercent(src.magicDamage);
     }
 
-    // 3) 暴击
+    // 6) 暴击（#156：附加伤害可独立设置暴击归属/倍率）
     let crit = false;
-    if (seg.canCrit) {
-      const family = (seg as DamageSegment).critFamily || 'physical';
-      const rate = (seg as DamageSegment).critChanceOverride ?? (family === 'physical' ? src.physicalCritRate : src.magicCritRate);
-      const dmg = family === 'physical' ? src.physicalCritDamage : src.magicCritDamage;
-      const res = resolveCrit(rate, dmg, this.config.randomMode, this.rng);
+    const critAllowed = opt.allowCrit ?? (seg as DamageSegment).canCrit;
+    if (critAllowed) {
+      const family = opt.critFamily ?? (seg as DamageSegment).critFamily ?? 'physical';
+      const rate = opt.critChanceOverride ?? (seg as DamageSegment).critChanceOverride ?? (family === 'physical' ? src.physicalCritRate : src.magicCritRate);
+      const baseDmg = opt.critDamageOverride ?? (family === 'physical' ? src.physicalCritDamage : src.magicCritDamage);
+      const res = resolveCrit(rate, baseDmg, this.config.randomMode, this.rng);
       crit = res.crit;
       raw *= res.multiplier;
     }
+    if (crit) { this.setStateTag(source, 'LAST_ATTACK_CRITICAL', true); this.setStateTag(source, 'HAS_CRIT_THIS_COMBAT', true); }
+    else if (sourceKind === 'basic_attack') this.setStateTag(source, 'LAST_ATTACK_CRITICAL', false);
 
-    // 4) 穿透 + 抗性（真实伤害默认不计算护甲/魔抗/穿透）
+    // 7) BEFORE_DAMAGE（#142-143）：伤害已产生、尚未扣护盾/生命，允许技能/装备/天赋生成护盾等防御
+    // 仅当确实产生伤害（raw>0）时触发，避免 0 伤害的命中触发无效防御（见 #142「伤害已经产生」）
+    if (raw > 0) {
+      this.fireTriggers(source, 'before_damage', atMs, { damageType }, chain);
+      this.fireTriggers(target, 'before_damage', atMs, { damageType }, chain);
+      this.refreshStateTags(target); // 刷新护盾状态标签供条件判断
+    }
+
+    // 8) 穿透 + 抗性（真实伤害默认不计算护甲/魔抗/穿透）
     let finalResist = 0;
     let resistRate = 0;
     if (damageType === 'physical') {
@@ -477,12 +780,12 @@ export class CombatEngine {
     }
     let afterResist = damageType === 'true' ? raw : raw * (1 - resistRate);
 
-    // 6) 伤害减免（受伤害方视角）
+    // 9) 伤害减免（受伤害方视角）
     if (damageType !== 'true' || !this.config.trueDamageIgnoresReduction) {
       afterResist *= 1 - clampPercent(tgt.damageReduction);
     }
 
-    // 7) 护盾吸收（真实伤害是否可吸收由 trueDamageAffectsShield 决定）
+    // 10) 护盾吸收（真实伤害是否可吸收由 trueDamageAffectsShield 决定）
     let absorbed = 0;
     if (afterResist > 0 && (damageType !== 'true' || this.config.trueDamageAffectsShield)) {
       absorbed = this.absorbIntoShields(atMs, target, damageType, afterResist);
@@ -493,68 +796,155 @@ export class CombatEngine {
       }
     }
 
-    // 8) 扣生命
-    const hpLoss = Math.max(0, afterResist);
-    target.combatant.hp = clampHp(target.combatant.hp - hpLoss);
+    // 11) 扣生命（先判致命伤害前事件，见 #144）
+    let hpLoss = Math.max(0, afterResist);
+    if (target.combatant.hp > 0 && target.combatant.hp - hpLoss <= 0) {
+      this.fireTriggers(target, 'before_lethal_damage', atMs, { damageType }, chain);
+      this.fireTriggers(source, 'before_lethal_damage', atMs, { damageType }, chain);
+      // 若在致命伤害前生成了护盾，将其吸收进本击
+      const rescued = this.absorbIntoShields(atMs, target, damageType, hpLoss);
+      if (rescued > 0) { hpLoss = Math.max(0, hpLoss - rescued); absorbed += rescued; }
+    }
+    const appliedLoss = Math.max(0, hpLoss);
+    target.combatant.hp = clampHp(target.combatant.hp - appliedLoss);
     const priorAlive = target.combatant.alive;
     target.combatant.alive = target.combatant.hp > 0;
 
     this.emit(crit ? 'crit' : seg.kind === 'dot' ? 'dot_tick' : 'damage', source.id, target.id, {
       skillId: meta.skillId, skillName: meta.skillName, itemId: meta.itemId, itemName: meta.itemName,
       talentId: meta.talentId, talentName: meta.talentName,
-      damageType, rawDamage: raw, crit, finalDamage: hpLoss, absorbedByShield: absorbed,
+      damageType, rawDamage: raw, crit, finalDamage: appliedLoss, absorbedByShield: absorbed,
       targetRemainingHp: target.combatant.hp,
-      description: `${source.combatant.label}${crit ? ' 暴击！' : ''} 造成${damageTypeLabel(damageType)}伤害 ${f(hpLoss)}（原伤害 ${f(raw)}）`,
+      rootEventId: chain?.rootEventId, parentEventId: this.events.length, sourceEffectId: chain ? chain.path[chain.path.length - 1] : undefined, triggerDepth: chain?.depth,
+      description: `${source.combatant.label}${crit ? ' 暴击！' : ''} 造成${damageTypeLabel(damageType)}伤害 ${f(appliedLoss)}（原伤害 ${f(raw)}）`,
       details: { finalResist, reductionRate: resistRate },
     });
 
     // 统计
-    this.accDamage(source, meta, damageType, raw, hpLoss, crit, seg.kind === 'dot' ? 'dot' : meta.sourceKind);
-    this.accTaken(target, damageType, hpLoss, absorbed, damageType);
+    this.accDamage(source, meta, damageType, raw, appliedLoss, crit, seg.kind === 'dot' ? 'dot' : sourceKind);
+    this.accTaken(target, damageType, appliedLoss, absorbed, damageType);
 
-    // 10) 吸血/回血
-    if (seg.kind === 'damage') {
-      if (seg.canLifesteal) {
-        if (damageType === 'physical' && src.physicalVamp > 0) this.vamp(source, hpLoss, clampPercent(src.physicalVamp), 'physicalVamp');
-        else if (damageType === 'magic' && src.magicVamp > 0) this.vamp(source, hpLoss, clampPercent(src.magicVamp), 'magicVamp');
-        if (seg.useAllVamp && src.allVamp > 0) this.vamp(source, hpLoss, clampPercent(src.allVamp), 'allVamp');
-        if (meta.sourceKind === 'basic_attack' && src.onHitHp > 0) {
-          this.vamp(source, src.onHitHp, 1, 'onHitHp', true);
-        }
-      }
+    // 12) 吸血/回血（附加伤害按 #158 开关）
+    const canLifesteal = opt.canLifesteal ?? (seg.kind === 'damage' && seg.canLifesteal);
+    if (canLifesteal && appliedLoss > 0) {
+      if (damageType === 'physical' && src.physicalVamp > 0) this.vamp(source, appliedLoss, clampPercent(src.physicalVamp), 'physicalVamp');
+      else if (damageType === 'magic' && src.magicVamp > 0) this.vamp(source, appliedLoss, clampPercent(src.magicVamp), 'magicVamp');
+      const useAll = opt.useAllVamp ?? (seg.kind === 'damage' && !!seg.useAllVamp);
+      if (useAll && src.allVamp > 0) this.vamp(source, appliedLoss, clampPercent(src.allVamp), 'allVamp');
+      if (sourceKind === 'basic_attack' && src.onHitHp > 0) this.vamp(source, src.onHitHp, 1, 'onHitHp', true);
     }
 
-    // 11) 装备/被动/天赋触发
-    if (seg.canTriggerItems && hpLoss > 0) {
-      this.fireTriggers(source, 'damage_dealt', atMs, { damageType });
-      if (meta.sourceKind === 'basic_attack') {
-        this.fireTriggers(source, 'basic_attack_hit', atMs, { damageType });
-        if (crit) this.fireTriggers(source, 'basic_attack_crit', atMs, {});
-        this.firePassives(source, 'on_hit', undefined, atMs);
-      } else if (meta.sourceKind === 'skill' || meta.sourceKind === 'dot') {
-        this.fireTriggers(source, 'skill_hit', atMs, { damageType, skillId: meta.skillId });
-        this.firePassives(source, 'on_hit', undefined, atMs);
+    // 13) 触发链（#158-161）：附加伤害通过 options 开关控制是否继续触发
+    const trigEquip = opt.triggerEquip ?? (seg.kind === 'damage' ? seg.canTriggerItems : true);
+    const trigPassive = opt.triggerPassive ?? true;
+    const trigTalent = opt.triggerTalent ?? true;
+    if (trigEquip && appliedLoss > 0) {
+      this.fireTriggers(source, 'damage_dealt', atMs, { damageType }, chain);
+      if (sourceKind === 'basic_attack') {
+        this.fireTriggers(source, 'basic_attack_hit', atMs, { damageType }, chain);
+        if (crit) this.fireTriggers(source, 'basic_attack_crit', atMs, {}, chain);
+        if (trigPassive) this.firePassives(source, 'on_hit', undefined, atMs, chain);
+      } else if (sourceKind === 'skill' || sourceKind === 'dot') {
+        this.setStateTag(source, 'LAST_SKILL_HIT', true);
+        this.setStateTag(source, 'HAS_SKILL_HIT_THIS_COMBAT', true);
+        this.fireTriggers(source, 'skill_hit', atMs, { damageType, skillId: meta.skillId }, chain);
+        if (trigPassive) this.firePassives(source, 'on_hit', undefined, atMs, chain);
       }
-      this.firePassives(source, 'on_damage_dealt', { damageType }, atMs);
-      if (crit) this.firePassives(source, 'on_basic_attack_crit', undefined, atMs);
+      this.firePassives(source, 'on_damage_dealt', { damageType }, atMs, chain);
+      if (crit) this.firePassives(source, 'on_basic_attack_crit', undefined, atMs, chain);
     }
 
     // 受击方触发
-    if (hpLoss > 0) {
-      this.fireTriggers(target, 'damage_taken', atMs, { damageType });
-      this.firePassives(target, 'on_damage_taken', undefined, atMs);
+    if (appliedLoss > 0) {
+      this.fireTriggers(target, 'damage_taken', atMs, { damageType }, chain);
+      this.firePassives(target, 'on_damage_taken', undefined, atMs, chain);
       const pct = target.combatant.maxHp > 0 ? (target.combatant.hp / target.combatant.maxHp) * 100 : 0;
       this.evaluateHpBelow(target, atMs, pct);
     }
 
-    // 12) 死亡
+    // 14) 死亡
     if (priorAlive && !target.combatant.alive) {
       this.emit('death', source.id, target.id, { targetRemainingHp: 0, description: `${target.combatant.label} 阵亡` });
       if (!target.isDummy) {
-        this.fireTriggers(source, 'kill', atMs, {});
-        this.firePassives(source, 'on_kill', undefined, atMs);
+        this.fireTriggers(source, 'kill', atMs, {}, chain);
+        this.firePassives(source, 'on_kill', undefined, atMs, chain);
       }
     }
+  }
+
+  /** 投射物/距离字段取值（见 #148）：默认取投射物实际飞行距离 */
+  private distanceFor(seg: DamageSegment): number {
+    if (seg.distanceScaling) return seg.travelDistance ?? seg.distanceScaling.minDistance;
+    return 0;
+  }
+
+  /** 距离伤害加成（见 #147）：低于最小距离无加成，超过最大距离封顶 */
+  private distanceBonus(ds: DamageDistanceScaling, distance: number): { add: number; addMul: number } {
+    const out = { add: 0, addMul: 0 };
+    if (distance <= ds.minDistance) return out;
+    const units = Math.max(0, Math.min(distance, ds.maxDistance) - ds.minDistance);
+    if (ds.perDistancePerUnit) out.add = units * ds.perDistancePerUnit;
+    if (ds.perDistancePercent) out.addMul = units * (ds.perDistancePercent / 100);
+    if (ds.maxBonusDamage != null) out.add = Math.min(out.add, ds.maxBonusDamage);
+    if (ds.maxMultiplier != null) out.addMul = Math.min(out.addMul, Math.max(0, ds.maxMultiplier - 1));
+    return out;
+  }
+
+  /** 生命值条件值来源（见 #150） */
+  private hpConditionValue(stat: DamageHpBonus['stat'], src: HeroStats, tgt: HeroStats): number {
+    switch (stat) {
+      case 'targetMaxHp': return tgt.maxHp;
+      case 'targetCurrentHp': return tgt.currentHp;
+      case 'targetHpPercent': return tgt.maxHp > 0 ? (tgt.currentHp / tgt.maxHp) * 100 : 0;
+      case 'targetLostHp': return tgt.maxHp - tgt.currentHp;
+      case 'targetLostHpPercent': return tgt.maxHp > 0 ? ((tgt.maxHp - tgt.currentHp) / tgt.maxHp) * 100 : 0;
+      case 'selfMaxHp': return src.maxHp;
+      case 'selfCurrentHp': return src.currentHp;
+      default: return 0;
+    }
+  }
+
+  /** 生命值阶梯增伤（见 #149-151）：满足条件增伤，每多 perUnit 额外加，封顶 */
+  private hpBonusPercent(hb: DamageHpBonus, src: HeroStats, tgt: HeroStats): number {
+    const v = this.hpConditionValue(hb.stat, src, tgt);
+    if (!cmp(v, hb.op, hb.value, hb.value2)) return 0;
+    let bonus = hb.bonusPercent;
+    if (hb.perUnit && hb.perBonusPercent) {
+      const excess = Math.max(0, v - hb.value);
+      bonus += Math.floor(excess / hb.perUnit) * hb.perBonusPercent;
+    }
+    return Math.min(bonus, hb.maxBonusPercent);
+  }
+
+  /** 增伤分类匹配（见 #169）：all 恒匹配；物理/魔法/真实按伤害类型；basic_attack/skill 按来源 */
+  private buffCategoryMatches(cat: BuffCategory | undefined, damageType: DamageType, sourceKind: DamageSourceKind): boolean {
+    const c = cat ?? 'all';
+    if (c === 'all' || c === damageType) return true;
+    if (c === 'basic_attack') return sourceKind === 'basic_attack';
+    if (c === 'skill') return sourceKind === 'skill' || sourceKind === 'dot';
+    return false;
+  }
+
+  /** 增伤 Buff（#167）：自身造成的伤害增加 */
+  private buffDamageMultiplier(unit: Unit, damageType: DamageType, sourceKind: DamageSourceKind): number {
+    if (!unit.hero) return 1;
+    let mult = 1;
+    for (const b of unit.hero.runtime.buffs) {
+      if (b.buffType !== 'damage_bonus') continue;
+      if (this.buffCategoryMatches(b.category, damageType, sourceKind)) mult *= 1 + b.value / 100;
+    }
+    return mult;
+  }
+
+  /** 易伤 Buff（#168）：自身受到的伤害增加 */
+  private buffVulnerableMultiplier(unit: Unit, damageType: DamageType, sourceKind: DamageSourceKind): number {
+    if (!unit.hero) return 1;
+    let mult = 1;
+    for (const b of unit.hero.runtime.buffs) {
+      if (b.buffType !== 'vulnerable') continue;
+      if (this.buffCategoryMatches(b.category, damageType, sourceKind)) mult *= 1 + b.value / 100;
+    }
+    return mult;
   }
 
   private vamp(
@@ -576,9 +966,17 @@ export class CombatEngine {
     meta?: SegmentMeta, silent = false,
   ): { healApplied: number; overheal: number } {
     if (!target.alive || amount <= 0) return { healApplied: 0, overheal: 0 };
+    // 禁疗（#166）：被治疗者身上的 grievous 降低治疗效果。0%=100 治疗→100；40%→60；100%→0。
+    let reduced = amount;
+    let grieve = 0;
+    const targetUnit = this.units.get(target.id);
+    if (targetUnit?.hero) {
+      grieve = buffTotal(this.runtimeOf(targetUnit), 'grievous');
+      if (grieve > 0) reduced = amount * (1 - clampPercent(grieve));
+    }
     const room = target.maxHp - target.hp;
-    const applied = Math.min(room, amount);
-    const over = amount - applied;
+    const applied = Math.min(room, reduced);
+    const over = reduced - applied;
     target.hp = Math.min(target.maxHp, target.hp + applied);
     const a = this.accum.get(source.id)!;
     a.lifesteal.totalHealing += applied;
@@ -586,7 +984,7 @@ export class CombatEngine {
     if (!silent) {
       this.emit('heal', source.id, target.id, {
         healing: applied, overheal: over, targetRemainingHp: target.hp,
-        description: `${target.label} ${label}恢复 ${f(applied)}${over > 0 ? `（溢出 ${f(over)}）` : ''}`,
+        description: `${target.label} ${label}恢复 ${f(applied)}${over > 0 ? `（溢出 ${f(over)}）` : ''}${reduced < amount ? `（禁疗 ${f(clampPercent(grieve) * 100)}%）` : ''}`,
       });
     }
     if (meta?.skillId) {
@@ -804,15 +1202,15 @@ export class CombatEngine {
   }
 
   // -------------------------------------------------------------- 公式
-  private evalFormula(unit0: Unit, unit1: Unit, base: number, scaling: StatScaling[], _atMs: number): number {
+  private evalFormula(unit0: Unit, unit1: Unit, base: number, scaling: StatScaling[], _atMs: number, snap?: DamageSnapshot): number {
     let value = base || 0;
-    for (const s of scaling) value += this.resolveStat(unit0, unit1, s.stat) * s.ratio;
+    for (const s of scaling) value += this.resolveStat(unit0, unit1, s.stat, snap) * s.ratio;
     return value;
   }
 
-  private resolveStat(source: Unit, target: Unit, stat: StatKey): number {
-    const src = source.combatant.stats;
-    const tgt = target.combatant.stats;
+  private resolveStat(source: Unit, target: Unit, stat: StatKey, snap?: DamageSnapshot): number {
+    const src = snap ? snap.source : source.combatant.stats;
+    const tgt = snap ? snap.target : target.combatant.stats;
     switch (stat) {
       case 'maxHp': return src.maxHp;
       case 'currentHp': return src.currentHp;
@@ -850,18 +1248,18 @@ export class CombatEngine {
     this.schedule(atMs + every, () => this.fireIntervalEquip(owner, item, effect, every, atMs + every));
   }
 
-  private evaluateEquipment(owner: Unit, atMs: number, ctx: { kind: EquipmentTrigger['kind']; damageType?: DamageType }): void {
+  private evaluateEquipment(owner: Unit, atMs: number, ctx: { kind: EquipmentTrigger['kind']; damageType?: DamageType }, chain?: TriggerChain): void {
     if (!owner.hero) return;
     for (const item of owner.hero.items) {
       for (const effect of item.effects) {
         if (effect.trigger.kind === 'on_interval') continue;
         // 兼容旧的专用枚举：on_skill_hit 对应统一事件 skill_hit；on_basic_attack_crit 对应 basic_attack_crit
         if (effect.trigger.kind === 'on_cast_skill') {
-          if (ctx.kind === 'on_cast_skill') this.triggerEquip(owner, item, effect, atMs);
+          if (ctx.kind === 'on_cast_skill') this.triggerEquip(owner, item, effect, atMs, chain);
           continue;
         }
         if (!this.triggerMatches(eventKindOf(effect.trigger.kind), ctx)) continue;
-        this.triggerEquip(owner, item, effect, atMs);
+        this.triggerEquip(owner, item, effect, atMs, chain);
       }
     }
   }
@@ -894,24 +1292,26 @@ export class CombatEngine {
     }
   }
 
-  private triggerEquip(owner: Unit, item: Equipment, effect: EquipmentEffect, atMs: number): void {
+  private triggerEquip(owner: Unit, item: Equipment, effect: EquipmentEffect, atMs: number, chain?: TriggerChain): void {
     if (!owner.hero) return;
     const key = `e:${effect.id}`;
     if (owner.hero.procCds.has(key) && owner.hero.procCds.get(key)! > atMs) return;
+    const child = this.nextTriggerChain(chain, `${item.id}:${effect.id}`);
+    if (!child) return;
     if (effect.limit) owner.hero.procCds.set(key, atMs + effect.limit.seconds * 1000);
     const acc = this.accum.get(owner.id)!;
     const it = this.itemOf(acc, item.id, item.name);
     it.procs++; it.times.push(atMs);
     const target = this.enemyOf(owner.id);
     this.emit('item_proc', owner.id, target?.id ?? owner.id, {
-      itemId: item.id, itemName: item.name,
+      itemId: item.id, itemName: item.name, rootEventId: child.rootEventId, triggerDepth: child.depth, sourceEffectId: `${item.id}:${effect.id}`,
       description: `装备「${item.name}」触发：${effect.name}`,
     });
     if (target) {
       for (const seg of effect.segments) {
         this.scheduleSegment(atMs, owner, target, seg, {
           sourceKind: 'item', sourceType: 'item', itemId: item.id, itemName: item.name,
-        });
+        }, child);
       }
     }
   }
@@ -921,38 +1321,81 @@ export class CombatEngine {
    * 统一触发器：技能被动、装备效果、天赋触发全部收敛到这里。
    * event 使用统一 TriggerEvent；同时兼容旧式 PassiveTrigger/EquipmentTrigger 命名（on_*）。
    */
-  private fireTriggers(unit: Unit, event: TriggerEvent | string, atMs: number, ctx: { damageType?: DamageType; skillId?: string }): void {
+  private fireTriggers(unit: Unit, event: TriggerEvent | string, atMs: number, ctx: { damageType?: DamageType; skillId?: string }, chain?: TriggerChain): void {
     if (!unit.hero || !unit.combatant.alive) return;
+    if (chain && chain.depth >= MAX_TRIGGER_DEPTH) { this.cappedTriggers++; return; }
     // 1) 被动技能
-    this.firePassives(unit, toPassiveKind(event), ctx, atMs);
+    this.firePassives(unit, toPassiveKind(event), ctx, atMs, chain);
     // 2) 装备效果
-    this.evaluateEquipment(unit, atMs, { kind: toEquipKind(event), damageType: ctx.damageType });
+    this.evaluateEquipment(unit, atMs, { kind: toEquipKind(event), damageType: ctx.damageType }, chain);
     // 3) 天赋
+    const enemy = this.enemyOf(unit.id);
     for (const talent of unit.hero.talents) {
       if (!talent.trigger || talent.type === 'attribute') continue;
       if (talent.trigger.event !== event) continue;
-      if (!this.conditionMatches(talent, event, ctx)) continue;
-      this.fireTalent(unit, talent, atMs);
+      if (talent.trigger.condition && !this.evaluateCondition(talent.trigger.condition, unit, enemy, ctx, event)) continue;
+      this.fireTalent(unit, talent, atMs, chain);
     }
   }
 
-  private conditionMatches(talent: Talent, event: TriggerEvent | string, ctx: { damageType?: DamageType; skillId?: string }): boolean {
-    const cond = talent.trigger?.condition;
-    if (!cond || cond.type === 'none') return true;
-    if (cond.type === 'damageType') {
-      if (event !== 'damage_dealt' && event !== 'skill_hit' && event !== 'damage_taken') return true;
-      return cond.damageType === ctx.damageType;
+  /** 条件求值（#172-174）：支持 AND/OR/NOT 组合、状态标签、Buff 层数、生命值比较 */
+  private evaluateCondition(cond: TriggerConditionKind, unit: Unit, target: Unit | undefined, ctx: { damageType?: DamageType; skillId?: string }, event: string): boolean {
+    const hasRuntime = !!unit.hero;
+    switch (cond.type) {
+      case 'none': return true;
+      case 'and': return cond.conditions.every((c) => this.evaluateCondition(c, unit, target, ctx, event));
+      case 'or': return cond.conditions.some((c) => this.evaluateCondition(c, unit, target, ctx, event));
+      case 'not': return !this.evaluateCondition(cond.condition, unit, target, ctx, event);
+      case 'damageType':
+        if (event !== 'damage_dealt' && event !== 'skill_hit' && event !== 'damage_taken') return true;
+        return cond.damageType === ctx.damageType;
+      case 'hpBelow': {
+        const hp = unit.combatant.maxHp > 0 ? (unit.combatant.hp / unit.combatant.maxHp) * 100 : 0;
+        return hp <= cond.hpBelowPercent;
+      }
+      case 'state':
+        return cond.present === (hasRuntime ? unit.hero!.runtime.stateTags.has(cond.state) : false);
+      case 'buffStack': {
+        const st = hasRuntime ? buffStacks(unit.hero!.runtime, cond.buffType) : 0;
+        return cmp(st, cond.op, cond.value);
+      }
+      case 'hpCompare': {
+        if (!target) return false;
+        const v = this.hpConditionValue(cond.stat, unit.combatant.stats, target.combatant.stats);
+        return cmp(v, cond.op, cond.value, cond.value2);
+      }
+      case 'every': // 由定时器调度，无需条件判断
+        return true;
+      default:
+        return true;
     }
-    return true;
   }
 
-  private fireTalent(unit: Unit, talent: Talent, atMs: number): void {
+  /**
+   * 触发链推进（#159-161）：
+   *  - 超过 MAX_TRIGGER_DEPTH → 返回 null（终止继续触发）
+   *  - allowSelfTrigger=false 时，若效果键已在祖先路径中出现 → 返回 null（防止 A→B→A 循环）
+   */
+  private nextTriggerChain(chain: TriggerChain | undefined, effectKey: string): TriggerChain | null {
+    const depth = chain ? chain.depth + 1 : 1;
+    if (depth > MAX_TRIGGER_DEPTH) { this.cappedTriggers++; return null; }
+    const path = chain ? [...chain.path, effectKey] : [effectKey];
+    if (!ALLOW_SELF_TRIGGER && path.slice(0, -1).includes(effectKey)) {
+      this.selfBlockedTriggers++;
+      return null;
+    }
+    return { rootEventId: chain ? chain.rootEventId : (this.events.length || 1), depth, path };
+  }
+
+  private fireTalent(unit: Unit, talent: Talent, atMs: number, chain?: TriggerChain): void {
     if (!unit.hero || !unit.combatant.alive) return;
     const key = `t:${talent.id}`;
     if (unit.hero.procCds.has(key) && unit.hero.procCds.get(key)! > atMs) return;
+    const child = this.nextTriggerChain(chain, talent.id);
+    if (!child) return;
     const target = this.enemyOf(unit.id);
     this.emit('talent_proc', unit.id, target?.id ?? unit.id, {
-      talentId: talent.id, talentName: talent.name,
+      talentId: talent.id, talentName: talent.name, rootEventId: child.rootEventId, triggerDepth: child.depth, sourceEffectId: talent.id,
       description: `天赋「${talent.name}」触发`,
     });
     if (target) {
@@ -960,7 +1403,7 @@ export class CombatEngine {
         this.scheduleSegment(atMs, unit, target, seg, {
           sourceKind: 'skill', sourceType: 'talent',
           talentId: talent.id, talentName: talent.name,
-        });
+        }, child);
       }
     }
   }
@@ -1009,30 +1452,33 @@ export class CombatEngine {
     this.schedule(atMs + every, () => this.fireIntervalPassive(unit, skill, every, atMs + every));
   }
 
-  private firePassive(unit: Unit, skill: Skill, atMs: number): void {
+  private firePassive(unit: Unit, skill: Skill, atMs: number, chain?: TriggerChain): void {
     if (!unit.hero || !skill.passive || !unit.combatant.alive) return;
     const key = `p:${skill.id}`;
     if (unit.hero.procCds.has(key) && unit.hero.procCds.get(key)! > atMs) return;
     if (skill.passive.procCooldownSeconds > 0) {
       unit.hero.procCds.set(key, atMs + skill.passive.procCooldownSeconds * 1000);
     }
+    const child = this.nextTriggerChain(chain, skill.id);
+    if (!child) return;
     const target = this.enemyOf(unit.id);
     this.emit('skill_cast', unit.id, target?.id ?? unit.id, {
-      skillId: skill.id, skillName: skill.name, description: `被动「${skill.name}」触发`,
+      skillId: skill.id, skillName: skill.name, rootEventId: child.rootEventId, triggerDepth: child.depth, sourceEffectId: skill.id,
+      description: `被动「${skill.name}」触发`,
     });
     this.skillOf(this.accum.get(unit.id)!, skill.id, skill.name).cast++;
-    this.fireTriggers(unit, 'cast_skill', atMs, { skillId: skill.id });
+    this.fireTriggers(unit, 'cast_skill', atMs, { skillId: skill.id }, child);
     if (target) {
       for (const seg of skill.segments) {
         this.scheduleSegment(atMs, unit, target, seg, {
           sourceKind: 'skill', sourceType: 'skill', skillId: skill.id, skillName: skill.name,
-        });
+        }, child);
       }
     }
   }
 
   private firePassives(
-    unit: Unit, kind: PassivePollKind, ctx: { damageType?: DamageType } | undefined, atMs: number,
+    unit: Unit, kind: PassivePollKind, ctx: { damageType?: DamageType } | undefined, atMs: number, chain?: TriggerChain,
   ): void {
     if (!unit.hero) return;
     for (const skill of unit.hero.skills) {
@@ -1042,7 +1488,7 @@ export class CombatEngine {
         kind === 'on_damage_dealt' && 'damageType' in skill.passive.trigger &&
         skill.passive.trigger.damageType && skill.passive.trigger.damageType !== ctx?.damageType
       ) continue;
-      this.firePassive(unit, skill, atMs);
+      this.firePassive(unit, skill, atMs, chain);
     }
   }
 
@@ -1056,6 +1502,33 @@ export class CombatEngine {
     let it = acc.items.get(id);
     if (!it) { it = { id, name, procs: 0, dmg: 0, heal: 0, shield: 0, times: [] }; acc.items.set(id, it); }
     return it;
+  }
+
+  private accBuff(unit: Unit, gained: boolean): void {
+    const acc = this.accum.get(unit.id)!;
+    if (gained) acc.buffs.gained++;
+    const r = this.runtimeOf(unit);
+    const asStacks = buffStacks(r, 'attack_speed');
+    if (asStacks > acc.buffs.maxAttackSpeedStacks) acc.buffs.maxAttackSpeedStacks = asStacks;
+  }
+
+  /** 扫除过期 Buff：攻速/突破重算，统计过期数（见 #136/#163） */
+  private sweepUnitBuffs(unit: Unit, atMs: number): void {
+    if (!unit.hero) return;
+    const r = this.runtimeOf(unit);
+    const removed = sweepExpired(r, atMs);
+    if (removed.length) {
+      this.accum.get(unit.id)!.buffs.expired += removed.length;
+      for (const b of removed) {
+        this.emit('buff', unit.id, unit.id, {
+          buffType: b.buffType, buffStacks: 0, buffAction: 'expired',
+          description: `${unit.combatant.label}的「${buffTypeLabel(b.buffType)}」自然结束`,
+        });
+      }
+    }
+    // 重算临时攻速 / 突破（随 Buff 生命周期实时变化）
+    r.tempAttackSpeed = buffTotal(r, 'attack_speed');
+    r.tempCapBreakthrough = buffTotal(r, 'attack_cap_break');
   }
 
   private accDamage(
@@ -1116,6 +1589,15 @@ export class CombatEngine {
           itemId: it.id, name: it.name, procCount: it.procs, damage: it.dmg, heal: it.heal,
           shield: it.shield, procTimesMs: it.times,
         })),
+        buffs: unit.hero
+          ? {
+              gained: acc.buffs.gained, expired: acc.buffs.expired,
+              activeAtEnd: unit.hero.runtime.buffs.length,
+              maxAttackSpeedStacks: acc.buffs.maxAttackSpeedStacks,
+              attackSpeedStacksAtEnd: buffStacks(unit.hero.runtime, 'attack_speed'),
+            }
+          : { gained: 0, expired: 0, activeAtEnd: 0, maxAttackSpeedStacks: 0, attackSpeedStacksAtEnd: 0 },
+        counters: unit.hero ? Object.fromEntries(unit.hero.runtime.counters) : {},
       });
     }
     const snapshot: CombatSnapshot = {

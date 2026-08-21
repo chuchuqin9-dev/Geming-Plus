@@ -10,7 +10,7 @@
  *  - 攻击间隔 / 冷却时长以「秒」存储（引擎内转毫秒）
  */
 
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 // ---------------------------------------------------------------------------
 // 基础枚举
@@ -32,10 +32,53 @@ export type SimMode = 'dummy' | 'vs';
 export type RandomMode = 'seeded' | 'expectation';
 
 /** 一段效果的类型：伤害 / 持续伤害(Dot) / 治疗 / 护盾 / 冷却减少 */
-export type EffectSegmentKind = 'damage' | 'dot' | 'heal' | 'shield' | 'cooldown_reduce';
+export type EffectSegmentKind = 'damage' | 'dot' | 'heal' | 'shield' | 'cooldown_reduce' | 'buff' | 'on_hit_damage';
 
 /** 伤害来源（用于伤害构成拆分） */
 export type DamageSourceKind = 'basic_attack' | 'skill' | 'item' | 'dot';
+
+/**
+ * 附加伤害标签（见 #157）：一个伤害实例可拥有多个标签。
+ * basic_attack 普通攻击伤害 / on_hit On-hit 伤害 / skill 技能伤害 / item 装备伤害 / talent 天赋伤害
+ */
+export type DamageTag = 'basic_attack' | 'on_hit' | 'skill' | 'item' | 'talent';
+
+/**
+ * 状态标签系统（见 #171-173）：战斗引擎自动维护，标签可作为 Condition 条件。
+ */
+export type StateTag =
+  | 'HAS_SHIELD'            // 是否存在护盾
+  | 'HAS_PHYSICAL_SHIELD'   // 是否存在物理护盾
+  | 'HAS_MAGIC_SHIELD'      // 是否存在魔法护盾
+  | 'HAS_ALL_SHIELD'        // 是否存在全类型护盾
+  | 'LAST_ATTACK_CRITICAL'  // 上一次普攻是否暴击
+  | 'HAS_CRIT_THIS_COMBAT'  // 本场是否曾暴击
+  | 'LAST_SKILL_HIT'        // 上一次技能是否命中
+  | 'HAS_SKILL_HIT_THIS_COMBAT' // 本场是否曾技能命中
+  | 'IS_CONSECUTIVE_ATTACKING'  // 是否处于连续攻击状态
+  | 'HAS_ATTACKED';         // 本场是否曾普攻
+
+/**
+ * Buff / Debuff 类型（见 #162-170）。百分比 value 统一以 0-100 存储。
+ */
+export type BuffType =
+  | 'attack_speed'     // 攻击速度 +X%（叠层/时长/刷新）
+  | 'slow'             // 移动速度 -X%
+  | 'grievous'         // 禁疗：治疗效果降低 X%（100 治疗 * (1-40%)）
+  | 'damage_bonus'     // 增伤：自身造成的伤害 +X%（可分类，见 BuffCategory）
+  | 'vulnerable'       // 易伤：自身受到的伤害 +X%
+  | 'control_immune'   // 控制免疫（见 #170）
+  | 'attack_cap_break' // 攻速上限突破（见 #133）
+  | 'lifesteal_boost'  // 吸血提升（保留）;
+
+/** 增伤/易伤的伤害分类（见 #169）：all=全部伤害 */
+export type BuffCategory = 'all' | 'physical' | 'magic' | 'true' | 'basic_attack' | 'skill';
+
+/** Buff 层数刷新方式（见 #136）：overall=整体刷新；independent=独立计时 */
+export type BuffRefreshMode = 'overall' | 'independent';
+
+/** Buff 结束原因（见 #163），用于区分不同结束方式触发不同效果 */
+export type BuffEndReason = 'expired' | 'removed' | 'dispelled' | 'consumed' | 'overwritten';
 
 /**
  * 统一触发-效果-参数（Trigger + Effect + Parameter）机制的事件类型。
@@ -69,14 +112,28 @@ export type TriggerEvent =
   /** 护盾被击破 */
   | 'shield_broken'
   /** 护盾时间结束消失 */
-  | 'shield_expired';
+  | 'shield_expired'
+  /** 伤害已产生但尚未扣除护盾/生命（BEFORE_DAMAGE，允许生成新防御效果） */
+  | 'before_damage'
+  /** 致命伤害前（预计使 HP<=0，预留） */
+  | 'before_lethal_damage';
 
 /** 触发条件（Key 值，默认无附加条件） */
 export type TriggerConditionKind =
   | { type: 'none' }
   | { type: 'damageType'; damageType: DamageType }
   | { type: 'hpBelow'; hpBelowPercent: number }
-  | { type: 'every'; everySeconds: number };
+  | { type: 'every'; everySeconds: number }
+  /* --- 状态标签条件（State Tag 作 Condition，见 #171-173） --- */
+  | { type: 'state'; state: StateTag; present: boolean }
+  /* --- 生命值条件比较（见 #150-151）：op 为 >,>=,<,<=,between --- */
+  | { type: 'hpCompare'; stat: 'targetMaxHp' | 'targetCurrentHp' | 'targetHpPercent' | 'targetLostHpPercent' | 'selfMaxHp' | 'selfCurrentHp'; op: '>' | '>=' | '<' | '<=' | 'between'; value: number; value2?: number }
+  /* --- 条件组合 AND / OR / NOT（见 #174） --- */
+  | { type: 'and'; conditions: TriggerConditionKind[] }
+  | { type: 'or'; conditions: TriggerConditionKind[] }
+  | { type: 'not'; condition: TriggerConditionKind }
+  /* --- Buff 层数条件，如 BUFF层数>=3 --- */
+  | { type: 'buffStack'; buffType: BuffType; op: '>' | '>=' | '<' | '<='; value: number };
 
 /** 触发抽象模型：事件 + 条件 */
 export interface Trigger {
@@ -130,6 +187,12 @@ export interface HeroStats {
   attackInterval: number;
   /** 攻击距离（保留，为后续移动/射程埋点） */
   attackRange: number;
+  /** 基础攻速值（攻速 RATING，见 #131；用于通过 AttackSpeedCapResolver 求得最低攻击间隔） */
+  baseAttackSpeed: number;
+  /** 攻速加成（0-100，见 #134；临时攻速由 Modifier/Buff 提供，不直接改模板） */
+  attackSpeedBonus: number;
+  /** 攻速上限突破（0-100，见 #133；降低最低攻击间隔，独立于攻速加成） */
+  attackCapBreakthrough: number;
 
   /** 物理暴击率（0-100） */
   physicalCritRate: number;
@@ -222,6 +285,62 @@ export interface DamageSegment {
   useMagicDamageBoost?: boolean;
   /** 允许全能吸血 */
   useAllVamp?: boolean;
+  /** 额外触发的吸血开关（见 #158） */
+  canMagicLifesteal?: boolean;
+  /** 是否触发天赋/被动等后续效果（见 #158） */
+  canTriggerPassives?: boolean;
+  canTriggerTalents?: boolean;
+  /** 附加伤害标签（见 #157）：一个伤害实例可有多个标签 */
+  tags?: DamageTag[];
+  /** 是否为「独立结算」的附加 On-hit 伤害实例（见 #154） */
+  isIndependentInstance?: boolean;
+  /** maxTriggerCount：该效果最多触发次数（见 #140），用完自动失效 */
+  maxTriggers?: number;
+  /* --- 投射物 / 距离伤害（见 #146-148） --- */
+  /** 投射物实际飞行距离（ProjectileTravelDistance，默认取该值作为距离参数） */
+  travelDistance?: number;
+  /** 距离伤害配置（距离越远伤害越高，封顶） */
+  distanceScaling?: DamageDistanceScaling;
+  /* --- 生命值相关增伤（见 #149-151） --- */
+  /** 目标满足指定生命值条件时增伤，可阶梯式递增、封顶 */
+  hpBonus?: DamageHpBonus;
+  /* --- 属性快照（见 #152） --- */
+  /** snapshot=使用效果生成时属性；dynamic=命中/触发时实时属性（默认 dynamic） */
+  snapshot?: 'dynamic' | 'snapshot';
+}
+
+/** 距离伤害配置（见 #147）：在基础伤害之外随飞行距离累加 */  
+export interface DamageDistanceScaling {
+  /** 最小距离：低于该距离无距离加成 */
+  minDistance: number;
+  /** 最大距离：超过后不再增加（封顶） */
+  maxDistance: number;
+  /** 每 X 距离增加固定 Y */
+  perDistancePerUnit?: number;
+  /** 每 X 距离增加 Y%（0-1 小数，作用于基础伤害） */
+  perDistancePercent?: number;
+  /** 最大额外伤害（绝对封顶） */
+  maxBonusDamage?: number;
+  /** 最大伤害倍率（相对基础伤害的封顶，如 2 = 最多 200%） */
+  maxMultiplier?: number;
+}
+
+/** 生命值阶梯增伤（见 #149-151） */
+export interface DamageHpBonus {
+  stat: 'targetMaxHp' | 'targetCurrentHp' | 'targetHpPercent' | 'targetLostHp' | 'targetLostHpPercent' | 'selfMaxHp' | 'selfCurrentHp';
+  /** 比较目标值；op=between 时 value 为下界、value2 为上界 */
+  op: '>' | '>=' | '<' | '<=' | 'between';
+  /** 触发下限 */
+  value: number;
+  value2?: number;
+  /** 基础增伤百分比（0-100，超过条件即获得） */
+  bonusPercent: number;
+  /** 每多 Y 单位额外增加 Z%（0-100） */
+  perUnit?: number;
+  /** 每 perUnit 额外增加的百分比（0-100） */
+  perBonusPercent?: number;
+  /** 最高增伤百分比（0-100，封顶） */
+  maxBonusPercent: number;
 }
 
 /** 持续伤害（按固定间隔生成多个独立伤害事件） */
@@ -242,6 +361,8 @@ export interface DotSegment {
   critChanceOverride?: number;
   canTriggerItems: boolean;
   useAllVamp?: boolean;
+  /** 属性快照（见 #152）：snapshot=用效果生成时属性；dynamic=跳伤时实时属性（默认） */
+  snapshot?: 'dynamic' | 'snapshot';
 }
 
 /** 治疗效果 */
@@ -300,8 +421,65 @@ export interface CooldownReduceSegment {
   skillIds?: string[];
 }
 
+/** Buff/Debuff 效果：给来源或目标施加一个可叠层、有时长、可刷新的模组（见 #134/#162-170） */
+export interface BuffSegment {
+  kind: 'buff';
+  /** 延迟（秒） */
+  delaySeconds: number;
+  /** 施加对象：self=来源自身；enemy=目标敌方 */
+  target: 'self' | 'enemy';
+  buffType: BuffType;
+  /** 每层数值（百分比 0-100）。如 attack_speed=20 表示攻速 +20% */
+  value: number;
+  /** 增伤/易伤的伤害分类（见 #169）；非增伤/易伤类型可省略 */
+  category?: BuffCategory;
+  /** 控制免疫的具体控制类型（见 #170，control_immune 时可用） */
+  controlTypes?: string[];
+  /** 持续时间（秒）；0=永久直到被移除/消耗 */
+  durationSeconds: number;
+  /** 最大层数（1=不叠层） */
+  maxStacks: number;
+  /** 层数刷新方式（见 #136） */
+  refreshMode: BuffRefreshMode;
+  /** 独立计时时每层独立时长（整体刷新使用 durationSeconds） */
+  stackDurationSeconds?: number;
+  /** 是否可被消耗（作为 maxTriggerCount 次数用尽时自动失效，见 #140） */
+  expiresOnUse?: boolean;
+  /** 可用次数（maxTriggerCount，见 #140） */
+  maxUses?: number;
+  /** 施加期间/结束时的效果列表（如护盾附带的被动效果） */
+  passiveEffects?: EffectSegment[];
+}
+
+/** 附加伤害片段（On-hit 额外伤害，独立 Damage Instance，见 #153-158） */
+export interface OnHitDamageSegment {
+  kind: 'on_hit_damage';
+  delaySeconds: number;
+  baseDamage: number;
+  scaling: StatScaling[];
+  damageType: DamageType;
+  /** 是否允许暴击（独立配置，见 #156） */
+  canCrit: boolean;
+  /** 使用物理暴击或魔法暴击（见 #156） */
+  critFamily: CritFamily;
+  /** 独立暴击倍率（覆盖角色暴击伤害，可选，见 #156） */
+  critChanceOverride?: number;
+  critDamageOverride?: number;
+  /** 吸血开关（见 #158） */
+  canPhysicalLifesteal: boolean;
+  canMagicLifesteal: boolean;
+  canAllVamp: boolean;
+  /** 是否继续触发装备/天赋/被动/其他 On-hit（见 #158） */
+  canTriggerEquip: boolean;
+  canTriggerTalent: boolean;
+  canTriggerPassive: boolean;
+  canTriggerOnHit: boolean;
+  /** 附加伤害标签（见 #157） */
+  tags: DamageTag[];
+}
+
 /** 效果片段的联合类型 */
-export type EffectSegment = DamageSegment | DotSegment | HealSegment | ShieldSegment | CooldownReduceSegment;
+export type EffectSegment = DamageSegment | DotSegment | HealSegment | ShieldSegment | CooldownReduceSegment | BuffSegment | OnHitDamageSegment;
 
 // ---------------------------------------------------------------------------
 // 技能系统
@@ -551,10 +729,79 @@ export interface RuntimeCombatant {
   maxHp: number;
   hp: number;
   alive: boolean;
-  /** 运行时护盾实例列表（多护盾按类型/存储吸收） */
   shields: ShieldInstance[];
   /** 累积承伤统计（引擎内即时累计，用于曲线） */
   _uiDamageTaken?: number;
+}
+
+/**
+ * 运行时 Buff/Debuff 实例（见 #162/#105）。战斗中的临时效果只能修改它，
+ * 不能直接修改 HeroTemplate（见 #176）。
+ */
+export interface BuffInstance {
+  id: string;
+  /** 来源标签（技能/装备/天赋/Buff 名） */
+  source: string;
+  owner: CombatantId;
+  buffType: BuffType;
+  /** 当前有效叠加值（百分比 0-100，= stacks × perStackValue + 基础） */
+  value: number;
+  /** 每层数值 */
+  perStackValue: number;
+  /** 当前层数 */
+  stacks: number;
+  /** 最大层数（0/1=不叠层） */
+  maxStacks: number;
+  /** 增伤/易伤分类（可选） */
+  category?: BuffCategory;
+  /** 控制免疫的具体控制类型 */
+  controlTypes?: string[];
+  /** 创建时间（毫秒） */
+  createTime: number;
+  /** 结束时间（毫秒）；0=永久 */
+  expireTime: number;
+  /** 刷新方式 */
+  refreshMode: BuffRefreshMode;
+  /** 独立计时时每层的结束时间 */
+  stackEndTimes?: number[];
+  /** 是否可被消耗（maxTriggerCount） */
+  expiresOnUse?: boolean;
+  /** 剩余可用次数（maxTriggerCount） */
+  uses?: number;
+  /** 结束原因（见 #163） */
+  endReason?: BuffEndReason;
+  /** 附带/结束效果 */
+  passiveEffects?: EffectSegment[];
+}
+
+/** 连续攻击状态（见 #141）：记录连续普攻 */
+export interface ConsecutiveAttackState {
+  current: number;
+  lastAttackTimeMs: number;
+  /** 允许间隔（毫秒）；超过则中断 */
+  allowedGapMs: number;
+  isAttacking: boolean;
+}
+
+/**
+ * 运行时状态（见 #176）：战斗中所有临时改造（Buff/Debuff/攻速层数/护盾/临时属性/
+ * Counter/State Tag）都集中于此处，与 HeroTemplate 完全分离。
+ */
+export interface CombatantRuntimeState {
+  /** 运行时 Buff/Debuff 实例列表 */
+  buffs: BuffInstance[];
+  /** 计数器（见 #138）：内置 key + 自定义 key */
+  counters: Map<string, number>;
+  /** 状态标签（见 #171） */
+  stateTags: Set<StateTag>;
+  /** 攻击序号（见 #139）：每一次普攻自增，从 1 开始 */
+  attackSequence: number;
+  /** 连续攻击状态（见 #141） */
+  consecutive: ConsecutiveAttackState;
+  /** 临时攻速加成（百分比 0-100，来自 Buff 叠加，不写回 stats） */
+  tempAttackSpeed: number;
+  /** 临时攻速上限突破（百分比 0-100） */
+  tempCapBreakthrough: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -578,6 +825,8 @@ export type EventType =
   | 'cooldown_reduce'
   | 'death'
   | 'cooldown_ready'
+  | 'buff'
+  | 'attack'
   | 'combat_end';
 
 export interface CombatEvent {
@@ -623,6 +872,27 @@ export interface CombatEvent {
   /** 目标剩余生命 */
   targetRemainingHp: number;
   description: string;
+  /* --- Buff 事件专属（见 #162-164） --- */
+  buffType?: BuffType;
+  buffStacks?: number;
+  buffAction?: 'created' | 'stack' | 'refreshed' | 'expired' | 'removed' | 'dispelled' | 'consumed';
+  /* --- 触发链追踪（见 #160-161） --- */
+  rootEventId?: number;
+  parentEventId?: number;
+  sourceEffectId?: string;
+  triggerDepth?: number;
+  /* --- 调试日志（见 #177） → 详细模式字段 --- */
+  debug?: {
+    attackSpeed?: number;
+    theoreticalInterval?: number;
+    minInterval?: number;
+    capBroken?: boolean;
+    attackSpeedStacks?: number;
+    buffs?: string[];
+    shields?: number;
+    counters?: Record<string, number>;
+    stateTags?: string[];
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -715,6 +985,17 @@ export interface CombatantResult {
   defense: DefenseStat;
   skills: PerSkillStat[];
   items: PerItemStat[];
+  /** Buff/Debuff 统计（见 #162/#164） */
+  buffs: {
+    gained: number;
+    expired: number;
+    activeAtEnd: number;
+    /** 攻速叠层峰值 */
+    maxAttackSpeedStacks: number;
+    attackSpeedStacksAtEnd: number;
+  };
+  /** 计数器快照（见 #138） */
+  counters: Record<string, number>;
 }
 
 export interface CurvePointMs {
@@ -846,6 +1127,9 @@ export function emptyStats(): HeroStats {
     moveSpeed: 350,
     attackInterval: 1.0,
     attackRange: 1,
+    baseAttackSpeed: 1500,
+    attackSpeedBonus: 0,
+    attackCapBreakthrough: 0,
 
     physicalCritRate: 0,
     physicalCritDamage: 175,

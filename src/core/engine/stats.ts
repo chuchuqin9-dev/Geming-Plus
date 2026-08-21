@@ -19,8 +19,10 @@ export function mergeStats(base: HeroStats, items: Equipment[]): HeroStats {
     }
     (out[k] as unknown as number) = v;
   }
-  // 命中值/最大生命保持一致，初始满血
-  out.currentHp = out.maxHp;
+  // 命中值/最大生命保持一致；初始当前生命沿用基础值（若给定），否则满血
+  out.currentHp = (Number.isFinite(base.currentHp) && base.currentHp > 0)
+    ? Math.min(base.currentHp, out.maxHp)
+    : out.maxHp;
   return out;
 }
 
@@ -55,7 +57,12 @@ export function buildHeroCombatant(
   applyTalentBuffs(stats, cfg.talents || []);
   // 天赋可能加成生命上限，同步满血
   stats.maxHp = Math.max(1, stats.maxHp);
-  stats.currentHp = stats.maxHp;
+  // 尊重初始当前生命（若未显式给出则满血）
+  const baseHp = cfg.hero.baseStats.currentHp;
+  const initialHp = Number.isFinite(baseHp)
+    ? Math.min(Math.max(0, baseHp), stats.maxHp)
+    : stats.maxHp;
+  stats.currentHp = initialHp > 0 ? initialHp : stats.maxHp;
   return {
     id, label,
     isDummy: false, isHero: true,
