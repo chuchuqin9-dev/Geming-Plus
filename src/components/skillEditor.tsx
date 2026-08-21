@@ -3,17 +3,24 @@
  */
 import type { Skill } from '../core/types';
 import { NumberField, SelectField, ToggleField, SectionLabel } from './ui';
-import { SegmentEditor, defaultSegment } from './segmentEditor';
+import { SegmentEditor, AddSegmentButton, defaultSegment } from './segmentEditor';
 
 const TRIGGERS = [
   { value: 'on_basic_attack_hit', label: '普攻命中' },
   { value: 'on_attack', label: '攻击时' },
   { value: 'on_hit', label: '命中时' },
+  { value: 'on_cast_skill', label: '释放技能' },
+  { value: 'on_skill_hit', label: '技能命中' },
   { value: 'on_damage_dealt', label: '造成伤害' },
   { value: 'on_damage_taken', label: '受到伤害' },
+  { value: 'on_hp_below', label: '生命低于%(自身)' },
   { value: 'on_combat_start', label: '战斗开始' },
   { value: 'on_interval', label: '固定间隔' },
   { value: 'on_kill', label: '击杀' },
+  { value: 'on_shield_created', label: '获得护盾' },
+  { value: 'on_shield_damaged', label: '护盾受到伤害' },
+  { value: 'on_shield_broken', label: '护盾被击破' },
+  { value: 'on_shield_expired', label: '护盾自然消失' },
 ];
 
 export function SkillEditor({ value, onChange }: { value: Skill; onChange: (s: Skill) => void }) {
@@ -61,7 +68,7 @@ export function SkillEditor({ value, onChange }: { value: Skill; onChange: (s: S
           const next = [...value.segments]; next[i] = s; patch({ segments: next });
         }} onRemove={() => patch({ segments: value.segments.filter((_, j) => j !== i) })} />
       ))}
-      <button type="button" className="btn sm" onClick={() => patch({ segments: [...value.segments, defaultSegment()] })}>+ 添加效果段</button>
+      <AddSegmentButton onAdd={(k) => patch({ segments: [...value.segments, defaultSegment(k)] })} />
     </div>
   );
 }

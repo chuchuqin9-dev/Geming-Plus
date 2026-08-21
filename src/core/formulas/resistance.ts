@@ -17,14 +17,14 @@ export function magicReductionRate(magicResist: number): number {
 
 /**
  * 对任意伤害类型应用抗性减伤。
- * true 伤害默认无视抗性。
+ * true（真实伤害）与 raw（原始伤害）默认无视抗性。
  */
 export function applyResistance(
   raw: number,
   damageType: DamageType,
   finalResist: number,
 ): { mitigated: number; reductionRate: number } {
-  if (damageType === 'true') {
+  if (damageType === 'true' || damageType === 'raw') {
     return { mitigated: raw, reductionRate: 0 };
   }
   const rate =

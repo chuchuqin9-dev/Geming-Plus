@@ -10,7 +10,7 @@
  */
 import { create } from 'zustand';
 import type {
-  BattlePreset, CombatConfig, CombatResult, Equipment, Hero, SavedSimulation, Skill,
+  BattlePreset, CombatConfig, CombatResult, Equipment, Hero, SavedSimulation, Skill, Talent, TalentBook,
 } from '../core/types';
 import { type StorageAdapter, type StorageSnapshot } from '../storage/adapter';
 import { defaultAdapter } from '../storage/localAdapter';
@@ -28,6 +28,8 @@ interface AppState {
   heroes: Hero[];
   equipment: Equipment[];
   skills: Skill[];
+  talents: Talent[];
+  talentBooks: TalentBook[];
   battlePresets: BattlePreset[];
   savedSimulations: SavedSimulation[];
 
@@ -35,6 +37,8 @@ interface AppState {
   selectedHeroId: string | null;
   selectedEqId: string | null;
   selectedSkillId: string | null;
+  selectedTalentId: string | null;
+  selectedTalentBookId: string | null;
   selectedPresetId: string | null;
 
   // 战斗模拟当前状态
@@ -50,15 +54,21 @@ interface AppState {
   removeEquipment: (id: string) => Promise<void>;
   upsertSkill: (s: Skill) => Promise<void>;
   removeSkill: (id: string) => Promise<void>;
+  upsertTalent: (t: Talent) => Promise<void>;
+  removeTalent: (id: string) => Promise<void>;
+  upsertTalentBook: (b: TalentBook) => Promise<void>;
+  removeTalentBook: (id: string) => Promise<void>;
   upsertPreset: (p: BattlePreset) => Promise<void>;
   removePreset: (id: string) => Promise<void>;
   saveSimulation: (result: CombatResult, name?: string) => Promise<void>;
   removeSimulation: (id: string) => Promise<void>;
-  toggleFavorite: (kind: 'hero' | 'equipment' | 'skill' | 'preset' | 'sim', id: string) => Promise<void>;
+  toggleFavorite: (kind: 'hero' | 'equipment' | 'skill' | 'talent' | 'talentBook' | 'preset' | 'sim', id: string) => Promise<void>;
 
   selectHero: (id: string | null) => void;
   selectEq: (id: string | null) => void;
   selectSkill: (id: string | null) => void;
+  selectTalent: (id: string | null) => void;
+  selectTalentBook: (id: string | null) => void;
   selectPreset: (id: string | null) => void;
 
   setCombatConfig: (cfg: CombatConfig) => void;
@@ -77,14 +87,16 @@ export const useAppStore = create<AppState>((set, get) => {
   const adapter = defaultAdapter();
 
   const reloadAll = async () => {
-    const [heroes, equipment, skills, battlePresets, savedSimulations] = await Promise.all([
+    const [heroes, equipment, skills, talents, talentBooks, battlePresets, savedSimulations] = await Promise.all([
       adapter.listHeroes(),
       adapter.listEquipment(),
       adapter.listSkills(),
+      adapter.listTalents(),
+      adapter.listTalentBooks(),
       adapter.listBattlePresets(),
       adapter.listSavedSimulations(),
     ]);
-    set({ heroes, equipment, skills, battlePresets, savedSimulations, ready: true });
+    set({ heroes, equipment, skills, talents, talentBooks, battlePresets, savedSimulations, ready: true });
   };
 
   const equipmentNameById = () => {
@@ -100,11 +112,15 @@ export const useAppStore = create<AppState>((set, get) => {
     heroes: [],
     equipment: [],
     skills: [],
+    talents: [],
+    talentBooks: [],
     battlePresets: [],
     savedSimulations: [],
     selectedHeroId: null,
     selectedEqId: null,
     selectedSkillId: null,
+    selectedTalentId: null,
+    selectedTalentBookId: null,
     selectedPresetId: null,
     combatConfig: buildCombatConfig({
       mode: 'dummy',
@@ -138,6 +154,12 @@ export const useAppStore = create<AppState>((set, get) => {
     upsertSkill: async (s) => { await adapter.saveSkill(s); await reloadAll(); },
     removeSkill: async (id) => { await adapter.deleteSkill(id); await reloadAll(); },
 
+    upsertTalent: async (t) => { await adapter.saveTalent(t); await reloadAll(); },
+    removeTalent: async (id) => { await adapter.deleteTalent(id); await reloadAll(); },
+
+    upsertTalentBook: async (b) => { await adapter.saveTalentBook(b); await reloadAll(); },
+    removeTalentBook: async (id) => { await adapter.deleteTalentBook(id); await reloadAll(); },
+
     upsertPreset: async (p) => { await adapter.saveBattlePreset(p); await reloadAll(); },
     removePreset: async (id) => { await adapter.deleteBattlePreset(id); await reloadAll(); },
 
@@ -156,6 +178,8 @@ export const useAppStore = create<AppState>((set, get) => {
         if (kind === 'hero') return get().heroes.find((x) => x.id === id);
         if (kind === 'equipment') return get().equipment.find((x) => x.id === id);
         if (kind === 'skill') return get().skills.find((x) => x.id === id);
+        if (kind === 'talent') return get().talents.find((x) => x.id === id);
+        if (kind === 'talentBook') return get().talentBooks.find((x) => x.id === id);
         if (kind === 'preset') return get().battlePresets.find((x) => x.id === id);
         if (kind === 'sim') return get().savedSimulations.find((x) => x.id === id);
         return undefined;
@@ -168,6 +192,8 @@ export const useAppStore = create<AppState>((set, get) => {
     selectHero: (id) => set({ selectedHeroId: id }),
     selectEq: (id) => set({ selectedEqId: id }),
     selectSkill: (id) => set({ selectedSkillId: id }),
+    selectTalent: (id) => set({ selectedTalentId: id }),
+    selectTalentBook: (id) => set({ selectedTalentBookId: id }),
     selectPreset: (id) => set({ selectedPresetId: id }),
 
     setCombatConfig: (cfg) => set({ combatConfig: cfg }),
@@ -199,6 +225,8 @@ export const useAppStore = create<AppState>((set, get) => {
         heroes: snap.heroes,
         equipment: snap.equipment,
         skills: snap.skills,
+        talents: snap.talents,
+        talentBooks: snap.talentBooks,
         battlePresets: snap.battlePresets,
         savedSimulations: snap.savedSimulations,
       }));
@@ -211,6 +239,8 @@ export const useAppStore = create<AppState>((set, get) => {
           heroes: backup.heroes,
           equipment: backup.equipment,
           skills: backup.skills,
+          talents: backup.talents,
+          talentBooks: backup.talentBooks,
           battlePresets: backup.battlePresets,
           savedSimulations: backup.savedSimulations,
         });
@@ -218,6 +248,8 @@ export const useAppStore = create<AppState>((set, get) => {
         for (const h of backup.heroes) await adapter.saveHero(h);
         for (const e of backup.equipment) await adapter.saveEquipment(e);
         for (const s of backup.skills) await adapter.saveSkill(s);
+        for (const t of backup.talents) await adapter.saveTalent(t);
+        for (const b of backup.talentBooks) await adapter.saveTalentBook(b);
         for (const p of backup.battlePresets) await adapter.saveBattlePreset(p);
         for (const s of backup.savedSimulations) await adapter.saveSimulation(s);
       }

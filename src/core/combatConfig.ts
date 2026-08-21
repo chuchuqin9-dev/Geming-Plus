@@ -3,7 +3,7 @@
  */
 import {
   type CombatConfig, type CombatantConfig, type DummyConfig, type Hero,
-  type RandomMode, type SimMode,
+  type RandomMode, type SimMode, type Talent,
   MAX_EQUIPMENT,
 } from './types';
 import { newDummy } from './defaults';
@@ -14,11 +14,15 @@ export interface BuildOptions {
   randomMode: RandomMode;
   seed?: number;
   trueDamageIgnoresReduction?: boolean;
+  /** 真实伤害是否可被全类型护盾吸收 */
+  trueDamageAffectsShield?: boolean;
   heroA: Hero;
   itemsA: string[];
+  talentsA?: Talent[];
   labelA?: string;
   heroB?: Hero;
   itemsB?: string[];
+  talentsB?: Talent[];
   labelB?: string;
   dummy?: DummyConfig;
   skillPriorityA?: string[];
@@ -27,21 +31,28 @@ export interface BuildOptions {
 
 export function buildCombatConfig(opts: BuildOptions): CombatConfig {
   const combos: CombatantConfig[] = [];
-  combos.push({ label: opts.labelA || opts.heroA.name, hero: opts.heroA, itemIds: opts.itemsA.slice(0, MAX_EQUIPMENT) });
+  combos.push({
+    label: opts.labelA || opts.heroA.name, hero: opts.heroA,
+    itemIds: opts.itemsA.slice(0, MAX_EQUIPMENT), talents: opts.talentsA || [],
+  });
   if (opts.mode === 'vs' && opts.heroB) {
-    combos.push({ label: opts.labelB || opts.heroB.name, hero: opts.heroB, itemIds: (opts.itemsB || []).slice(0, MAX_EQUIPMENT) });
+    combos.push({
+      label: opts.labelB || opts.heroB.name, hero: opts.heroB,
+      itemIds: (opts.itemsB || []).slice(0, MAX_EQUIPMENT), talents: opts.talentsB || [],
+    });
   }
   const skillPriority: Record<string, string[]> = {};
   if (opts.skillPriorityA) skillPriority['A'] = opts.skillPriorityA;
   if (opts.skillPriorityB) skillPriority['B'] = opts.skillPriorityB;
 
   const config: CombatConfig = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     mode: opts.mode,
     durationSeconds: Math.max(0.1, opts.durationSeconds),
     randomMode: opts.randomMode,
     seed: opts.seed,
     trueDamageIgnoresReduction: opts.trueDamageIgnoresReduction ?? true,
+    trueDamageAffectsShield: opts.trueDamageAffectsShield ?? false,
     combos,
     dummy: opts.dummy || newDummy(),
     skillPriority,

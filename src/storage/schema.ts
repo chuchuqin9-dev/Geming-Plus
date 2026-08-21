@@ -7,7 +7,8 @@
  */
 import {
   type AnyTemplate, type BackupFile, type BattlePreset, type Equipment,
-  type Hero, type SavedSimulation, type Skill, SCHEMA_VERSION,
+  type Hero, type SavedSimulation, type Skill, type Talent, type TalentBook,
+  SCHEMA_VERSION,
 } from '../core/types';
 import { uid } from '../core/defaults';
 
@@ -38,12 +39,12 @@ export function migrateToCurrent(data: unknown, version: number): { version: num
 }
 
 // 向后兼容：为缺失 id 的项补充 id
-function ensureIds(data: unknown, kind: 'hero' | 'equipment' | 'skill' | 'preset' | 'sim'): unknown {
+function ensureIds(data: unknown, kind: 'hero' | 'equipment' | 'skill' | 'talent' | 'talentBook' | 'preset' | 'sim'): unknown {
   const arr = (data as Array<{ id?: string }>) || [];
   let counter = 0;
   return arr.map((item) => {
     if (item && !item.id) {
-      const base = kind === 'hero' ? 'h' : kind === 'equipment' ? 'e' : kind === 'skill' ? 's' : kind === 'preset' ? 'p' : 'sim';
+      const base = kind === 'hero' ? 'h' : kind === 'equipment' ? 'e' : kind === 'skill' ? 's' : kind === 'talent' ? 't' : kind === 'talentBook' ? 'tb' : kind === 'preset' ? 'p' : 'sim';
       return { ...item, id: uid(`${base}${counter++}`) };
     }
     return item;
@@ -71,6 +72,8 @@ export function normalizeBackup(raw: { schemaVersion?: number } & Partial<Backup
     heroes: ensureIds(src.heroes || [], 'hero') as Hero[],
     equipment: ensureIds(src.equipment || [], 'equipment') as Equipment[],
     skills: ensureIds(src.skills || [], 'skill') as Skill[],
+    talents: ensureIds(src.talents || [], 'talent') as Talent[],
+    talentBooks: ensureIds(src.talentBooks || [], 'talentBook') as TalentBook[],
     battlePresets: ensureIds(src.battlePresets || [], 'preset') as BattlePreset[],
     savedSimulations: ensureIds(src.savedSimulations || [], 'sim') as SavedSimulation[],
   };
@@ -82,10 +85,12 @@ export function isBackupFile(x: unknown): x is BackupFile {
 }
 
 /** 包装单个模板（带 schemaVersion），供多模板导入使用 */
-export function wrapTemplate(data: Hero | Equipment | Skill | BattlePreset): AnyTemplate {
+export function wrapTemplate(data: Hero | Equipment | Skill | Talent | TalentBook | BattlePreset): AnyTemplate {
   const kind =
     'baseStats' in data && 'skills' in data ? 'hero'
-      : 'effects' in data && 'stats' in data ? 'equipment'
-        : 'segments' in data ? 'skill' : 'battle';
+      : 'effects' in data && 'stats' in data && !('trigger' in data) ? 'equipment'
+        : 'segments' in data ? 'skill'
+          : 'effects' in data && 'heroId' in data ? 'talent'
+            : 'talentIds' in data ? 'talentBook' : 'battle';
   return { kind, schemaVersion: CURRENT_SCHEMA_VERSION, data } as AnyTemplate;
 }
