@@ -1,0 +1,20 @@
+{
+  "name": "MOBA 对战模拟器 · 英雄数值实验室",
+  "short_name": "MOBA实验室",
+  "description": "基于时间轴与战斗事件驱动的 MOBA 数值模拟分析工具",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#0f1219",
+  "theme_color": "#0f172a",
+  "lang": "zh-CN",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "192x192",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
