@@ -4,7 +4,7 @@
 import type { Equipment, EquipmentEffect, HeroStats } from '../core/types';
 import { useAppStore } from '../store/useAppStore';
 import { Card, NumberField, SectionLabel, SelectField, TextField } from '../components/ui';
-import { SegmentEditor, defaultSegment } from '../components/segmentEditor';
+import { SegmentEditor, AddSegmentButton, defaultSegment } from '../components/segmentEditor';
 import { newEquipment, newEquipmentEffect, uid } from '../core/defaults';
 
 const STAT_KEYS: Array<{ key: keyof HeroStats; label: string; type: 'num' | 'pct' | 'frac' }> = [
@@ -38,6 +38,7 @@ const STAT_KEYS: Array<{ key: keyof HeroStats; label: string; type: 'num' | 'pct
 const TRIGGER_OPTIONS = [
   { value: 'on_basic_attack_hit', label: '普攻命中' },
   { value: 'on_basic_attack_crit', label: '普攻暴击' },
+  { value: 'on_cast_skill', label: '释放技能' },
   { value: 'on_skill_hit', label: '技能命中' },
   { value: 'on_damage_dealt', label: '造成伤害' },
   { value: 'on_damage_taken', label: '受到伤害' },
@@ -45,6 +46,10 @@ const TRIGGER_OPTIONS = [
   { value: 'on_combat_start', label: '战斗开始' },
   { value: 'on_interval', label: '固定间隔' },
   { value: 'on_kill', label: '击杀' },
+  { value: 'on_shield_created', label: '获得护盾' },
+  { value: 'on_shield_damaged', label: '护盾受到伤害' },
+  { value: 'on_shield_broken', label: '护盾被击破' },
+  { value: 'on_shield_expired', label: '护盾自然消失' },
 ];
 
 export function EquipmentLibrary() {
@@ -151,7 +156,7 @@ function EquipmentEffectEditor({ effect, onChange, onRemove }: { effect: Equipme
       {effect.segments.map((seg, i) => (
         <SegmentEditor key={i} index={i} value={seg} onChange={(n) => { const next = [...effect.segments]; next[i] = n; patch({ segments: next }); }} onRemove={() => patch({ segments: effect.segments.filter((_, j) => j !== i) })} />
       ))}
-      <button type="button" className="btn sm" onClick={() => patch({ segments: [...effect.segments, defaultSegment()] })}>+ 添加效果段</button>
+      <AddSegmentButton onAdd={(k) => patch({ segments: [...effect.segments, defaultSegment(k)] })} />
     </div>
   );
 }

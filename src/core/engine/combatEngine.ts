@@ -5,14 +5,18 @@
  *  - 时间统一毫秒；用最小堆按时间取出最早事件，绝不按 1ms 暴力循环。
  *  - 同刻事件按 (timeMs, seq) 确定顺序，保证可复现。
  *  - 伤害走模块化流水线：原始→增伤→暴击→穿透→抗性→减伤→护盾→扣血→吸血→触发。
- *  - 技能/装备均为「片段(EffectSegment)」统一解析，普攻是内置技能。
+ *  - 技能/装备/天赋均为「效果片段(EffectSegment)」统一解析，普攻是内置技能。
+ *  - 所有触发器统一收敛到 fireTrigger(s)，实现 Trigger + Effect + Parameter 机制，
+ *    技能被动 / 装备效果 / 天赋触发不再针对单一对象写死。
  */
 import {
   type CombatConfig, type CombatEvent, type CombatResult, type CombatSnapshot,
-  type CombatantId, type DamageSegment, type DamageSourceKind, type DamageType,
-  type DotSegment, type EffectSegment, type Equipment, type EquipmentEffect,
-  type EquipmentTrigger, type EventType, type RuntimeCombatant, type HeroStats,
-  type ShieldSegment, type Skill, type StatKey, type StatScaling,
+  type CombatantId, type CooldownReduceSegment, type DamageSegment,
+  type DamageSourceKind, type DamageType, type DotSegment, type EffectSegment,
+  type Equipment, type EquipmentEffect, type EquipmentTrigger, type EventType,
+  type PassiveTrigger, type RuntimeCombatant, type HeroStats, type ShieldInstance,
+  type ShieldSegment, type ShieldType, type Skill, type StatKey, type StatScaling,
+  type Talent, type TalentType, type TriggerEvent,
   BASIC_ATTACK_SKILL_MARKER,
 } from '../types';
 import { clampPercent } from '../formulas/cooldown';
@@ -20,6 +24,7 @@ import { createRng, Rng } from './rng';
 import { resolveCrit } from '../formulas/crit';
 import { finalArmor, finalMagicResist } from '../formulas/penetration';
 import { buildDummyCombatant, buildHeroCombatant, clampHp } from './stats';
+import { uid } from '../defaults';
 
 const SAMPLE_MS = 250;
 
@@ -86,10 +91,11 @@ function buildBasicAttackSegment(stats: HeroStats): DamageSegment {
 interface UnitHero {
   skills: Skill[];
   items: Equipment[];
+  talents: Talent[];
   basicAttack: DamageSegment;
   /** 技能就绪时间（毫秒） */
   skillCds: Map<string, number>;
-  /** 装备效果/被动技能内部冷却就绪时间 */
+  /** 装备效果/被动技能/天赋内部冷却就绪时间 */
   procCds: Map<string, number>;
 }
 
@@ -107,23 +113,33 @@ interface RunAccum {
     critDamage: number; critCount: number; hitCount: number;
   };
   lifesteal: { totalHealing: number; overheal: number; physicalVamp: number; magicVamp: number; allVamp: number; onHitHp: number };
-  defense: { damageTaken: number; physicalTaken: number; magicTaken: number; trueTaken: number; shieldAbsorbed: number; shieldGenerated: number };
+  defense: {
+    damageTaken: number; physicalTaken: number; magicTaken: number; trueTaken: number;
+    shieldAbsorbed: number; shieldGenerated: number;
+    shieldsGained: number; shieldTotal: number; shieldMaxSingle: number;
+    physicalShieldAbsorbed: number; magicShieldAbsorbed: number; allShieldAbsorbed: number;
+    shieldBroken: number; shieldExpired: number;
+  };
   skills: Map<string, { id: string; name: string; cast: number; hits: number; dmg: number; crits: number; heal: number; shield: number }>;
   items: Map<string, { id: string; name: string; procs: number; dmg: number; heal: number; shield: number; times: number[] }>;
 }
 
 interface SegmentMeta {
   sourceKind: DamageSourceKind;
-  sourceType: 'basic_attack' | 'skill' | 'item' | 'dot';
+  sourceType: 'basic_attack' | 'skill' | 'item' | 'talent' | 'dot';
   skillId?: string;
   skillName?: string;
   itemId?: string;
   itemName?: string;
+  talentId?: string;
+  talentName?: string;
 }
 
 type PassivePollKind =
   | 'on_damage_dealt' | 'on_damage_taken' | 'on_kill'
-  | 'on_basic_attack_hit' | 'on_attack' | 'on_hit';
+  | 'on_basic_attack_hit' | 'on_basic_attack_crit' | 'on_attack' | 'on_hit'
+  | 'on_cast_skill' | 'on_skill_hit'
+  | 'on_shield_created' | 'on_shield_damaged' | 'on_shield_broken' | 'on_shield_expired';
 
 function f(n: number): string {
   if (!Number.isFinite(n)) return '0';
@@ -131,6 +147,9 @@ function f(n: number): string {
 }
 function damageTypeLabel(d: DamageType): string {
   return d === 'physical' ? '物理' : d === 'magic' ? '魔法' : '真实';
+}
+function shieldTypeLabel(t: ShieldType): string {
+  return t === 'physical' ? '物理' : t === 'magic' ? '魔法' : '全类型';
 }
 
 export class CombatEngine {
@@ -162,9 +181,6 @@ export class CombatEngine {
     this.initUnits();
     this.initEvents();
     this.sampleAt(0);
-    // 循环按时间从小到大弹出事件；只处理 timeMs <= endMs 的事件，
-    // 保证边界时刻（timeMs === endMs）的事件全部执行完再结束，
-    // 避免同刻多事件（普攻+技能就绪）被截断。
     while (this.heap.size > 0 && !this.ended) {
       const action = this.heap.pop()!;
       if (action.timeMs > this.endMs) break;
@@ -196,6 +212,7 @@ export class CombatEngine {
         hero: {
           skills: cfg.hero.skills,
           items,
+          talents: cfg.talents || [],
           basicAttack: buildBasicAttackSegment(combatant.stats),
           skillCds: new Map(),
           procCds: new Map(),
@@ -216,7 +233,7 @@ export class CombatEngine {
     return {
       damage: { total: 0, physical: 0, magic: 0, trueDmg: 0, basicAttack: 0, skill: 0, item: 0, dot: 0, critDamage: 0, critCount: 0, hitCount: 0 },
       lifesteal: { totalHealing: 0, overheal: 0, physicalVamp: 0, magicVamp: 0, allVamp: 0, onHitHp: 0 },
-      defense: { damageTaken: 0, physicalTaken: 0, magicTaken: 0, trueTaken: 0, shieldAbsorbed: 0, shieldGenerated: 0 },
+      defense: { damageTaken: 0, physicalTaken: 0, magicTaken: 0, trueTaken: 0, shieldAbsorbed: 0, shieldGenerated: 0, shieldsGained: 0, shieldTotal: 0, shieldMaxSingle: 0, physicalShieldAbsorbed: 0, magicShieldAbsorbed: 0, allShieldAbsorbed: 0, shieldBroken: 0, shieldExpired: 0 },
       skills: new Map(),
       items: new Map(),
     };
@@ -233,11 +250,13 @@ export class CombatEngine {
         }
       }
       this.fireCombatStartPassives(unit);
+      this.fireCombatStartTalents(unit);
       this.scheduleIntervalEquipment(unit);
+      this.scheduleIntervalTalents(unit);
     }
   }
 
-  // ---------------------------------------------------------------- 工具
+  // ------------------------------------------------------------- 工具
   private schedule(ms: number, run: () => void): void {
     this.heap.push({ timeMs: ms, seq: this.seq++, run });
   }
@@ -248,7 +267,6 @@ export class CombatEngine {
     targetId: CombatantId,
     partial: Partial<CombatEvent> = {},
   ): void {
-    // 我们在 this.emit 推送时需基于当前 this.now
     this.events.push({
       eventId: this.events.length,
       timestampMs: this.now,
@@ -274,8 +292,6 @@ export class CombatEngine {
 
   private checkEnd(): void {
     if (this.ended) return;
-    // 注意：不在此处处理「超时」。超时由 run() 循环在时间边界统一收尾，
-    // 否则同刻（timeMs === endMs）的剩余事件会被提前截断。
     const heroes = [...this.units.values()].filter((u) => !!u.hero);
     const aliveHeroes = heroes.filter((u) => u.combatant.alive);
     if (!aliveHeroes.length) { this.ended = true; this.endReason = 'all_dead'; return; }
@@ -308,7 +324,7 @@ export class CombatEngine {
     }
   }
 
-  // ---------------------------------------------------------------- 普攻
+  // --------------------------------------------------------------- 普攻
   private autoAttack(unit: Unit, atMs: number): void {
     if (!unit.combatant.alive) return;
     const target = this.enemyOf(unit.id);
@@ -317,26 +333,28 @@ export class CombatEngine {
       sourceKind: 'basic_attack', sourceType: 'basic_attack',
       skillId: BASIC_ATTACK_SKILL_MARKER, skillName: '普通攻击',
     });
-    this.firePassives(unit, 'on_basic_attack_hit', undefined, atMs);
-    this.firePassives(unit, 'on_attack', undefined, atMs);
+    this.fireTriggers(unit, 'basic_attack_hit', atMs, {});
+    this.fireTriggers(unit, 'on_attack', atMs, {}); // 兼容旧枚举：攻击时
     const next = atMs + Math.max(1, unit.combatant.stats.attackInterval * 1000);
     this.schedule(next, () => this.autoAttack(unit, next));
   }
 
-  // ---------------------------------------------------------------- 技能
+  // --------------------------------------------------------------- 技能
   private castReadySkill(unit: Unit, skill: Skill, atMs: number): void {
     if (!unit.hero || !skill.active) return;
     if (!unit.combatant.alive) return;
     const readyAt = unit.hero.skillCds.get(skill.id) ?? 0;
     if (atMs < readyAt) return;
-    unit.hero.skillCds.set(skill.id, atMs);
     const cdMs = Math.max(1, skill.active.cooldownSeconds * 1000 * (1 - this.cdrOf(unit)));
+    unit.hero.skillCds.set(skill.id, atMs + cdMs); // skillCds 记录「下一次可释放时间」
     const target = this.enemyOf(unit.id);
     this.emit('skill_cast', unit.id, target?.id ?? unit.id, {
       skillId: skill.id, skillName: skill.name,
       description: `释放技能「${skill.name}」`,
     });
     this.skillOf(this.accum.get(unit.id)!, skill.id, skill.name).cast++;
+    // 释放技能触发：cast_skill
+    this.fireTriggers(unit, 'cast_skill', atMs, { skillId: skill.id });
     if (target) {
       for (const seg of skill.segments) {
         this.scheduleSegment(atMs, unit, target, seg, {
@@ -344,26 +362,31 @@ export class CombatEngine {
         });
       }
     }
-    this.schedule(atMs + cdMs, () => this.skillReadyEvent(unit, skill, atMs + cdMs, cdMs));
+    this.schedule(atMs + cdMs, () => this.skillReadyEvent(unit, skill, atMs + cdMs));
   }
 
-  private skillReadyEvent(unit: Unit, skill: Skill, atMs: number, cdMs: number): void {
+  /**
+   * 技能就绪事件。若当前 skillCds 中有更晚/更早的就绪时间已覆盖本次事件（如冷却被减少后的
+   * 提前就绪事件已先触发并刷新 chain），则本次为过期事件，直接忽略，避免把就绪时间回拨。
+   */
+  private skillReadyEvent(unit: Unit, skill: Skill, atMs: number): void {
     if (!unit.hero) return;
+    const existing = unit.hero.skillCds.get(skill.id) ?? 0;
+    if (existing > atMs) return; // 已由更早的就绪事件接管（冷却减少），忽略过期事件
     unit.hero.skillCds.set(skill.id, atMs);
     this.emit('cooldown_ready', unit.id, unit.id, {
       skillId: skill.id, skillName: skill.name,
-      description: `技能「${skill.name}」冷却完成（${(cdMs / 1000).toFixed(1)}s）`,
+      description: `技能「${skill.name}」冷却完成（${(atMs / 1000).toFixed(1)}s）`,
     });
     if (unit.combatant.alive) this.castReadySkill(unit, skill, atMs);
   }
 
-  // ---------------------------------------------------------------- 片段
+  // -------------------------------------------------------------- 片段
   private scheduleSegment(
     baseMs: number, source: Unit, target: Unit, seg: EffectSegment, meta: SegmentMeta,
   ): void {
     const at = baseMs + Math.round((seg.delaySeconds || 0) * 1000);
     if (at === baseMs) {
-      // 零延迟片段同步解析，避免边界时刻被 checkEnd 截断
       this.applySegment(at, source, target, seg, meta);
       return;
     }
@@ -384,17 +407,15 @@ export class CombatEngine {
       case 'heal': {
         const amount = this.evalFormula(source, target, seg.basePower, seg.scaling, atMs);
         this.healCombatant(atMs, source.combatant, amount, source, `${seg.basePower} 治疗量`, meta);
-        if (meta?.skillId) {
-          this.skillOf(this.accum.get(source.id)!, meta.skillId, meta.skillName || '').cast += 0;
-        }
         break;
       }
-      case 'shield': {
-        const amount = this.evalFormula(source, target, seg.basePower, seg.scaling, atMs);
-        this.gainShield(atMs, source.combatant, amount, source.id);
-        if (meta?.skillId) this.itemOfNope(meta);
+      case 'shield':
+        // 护盾作为自身增益，作用于来源单位（与 heal 一致）；伤害类效果仍作用于 target
+        this.gainShield(atMs, source, source, seg, meta);
         break;
-      }
+      case 'cooldown_reduce':
+        this.reduceCooldowns(atMs, source, seg, meta);
+        break;
     }
   }
 
@@ -411,10 +432,7 @@ export class CombatEngine {
     }
   }
 
-  // 无用占位，仅为避免未使用告警（segments heal/shield 规划字段）
-  private itemOfNope(_meta: SegmentMeta): void {}
-
-  // ---------------------------------------------------------------- 伤害流水线
+  // -------------------------------------------------------------- 伤害流水线
   private dealDamage(
     atMs: number, source: Unit, target: Unit, seg: DamageSegment | DotSegment, meta: SegmentMeta,
   ): void {
@@ -447,7 +465,7 @@ export class CombatEngine {
       raw *= res.multiplier;
     }
 
-    // 4) 穿透 + 抗性
+    // 4) 穿透 + 抗性（真实伤害默认不计算护甲/魔抗/穿透）
     let finalResist = 0;
     let resistRate = 0;
     if (damageType === 'physical') {
@@ -464,15 +482,14 @@ export class CombatEngine {
       afterResist *= 1 - clampPercent(tgt.damageReduction);
     }
 
-    // 7) 护盾吸收
+    // 7) 护盾吸收（真实伤害是否可吸收由 trueDamageAffectsShield 决定）
     let absorbed = 0;
-    if (target.combatant.shield > 0 && afterResist > 0) {
-      absorbed = Math.min(target.combatant.shield, afterResist);
-      target.combatant.shield -= absorbed;
+    if (afterResist > 0 && (damageType !== 'true' || this.config.trueDamageAffectsShield)) {
+      absorbed = this.absorbIntoShields(atMs, target, damageType, afterResist);
       afterResist -= absorbed;
       if (absorbed > 0) {
-        this.emit('shield_absorbed', source.id, target.id, { absorbedByShield: absorbed, targetRemainingHp: target.combatant.hp, description: `护盾吸收 ${f(absorbed)} 伤害` });
         this.accum.get(target.id)!.defense.shieldAbsorbed += absorbed;
+        this.emit('shield_absorbed', source.id, target.id, { absorbedByShield: absorbed, targetRemainingHp: target.combatant.hp, description: `护盾吸收 ${f(absorbed)} 伤害` });
       }
     }
 
@@ -484,6 +501,7 @@ export class CombatEngine {
 
     this.emit(crit ? 'crit' : seg.kind === 'dot' ? 'dot_tick' : 'damage', source.id, target.id, {
       skillId: meta.skillId, skillName: meta.skillName, itemId: meta.itemId, itemName: meta.itemName,
+      talentId: meta.talentId, talentName: meta.talentName,
       damageType, rawDamage: raw, crit, finalDamage: hpLoss, absorbedByShield: absorbed,
       targetRemainingHp: target.combatant.hp,
       description: `${source.combatant.label}${crit ? ' 暴击！' : ''} 造成${damageTypeLabel(damageType)}伤害 ${f(hpLoss)}（原伤害 ${f(raw)}）`,
@@ -492,7 +510,7 @@ export class CombatEngine {
 
     // 统计
     this.accDamage(source, meta, damageType, raw, hpLoss, crit, seg.kind === 'dot' ? 'dot' : meta.sourceKind);
-    this.accTaken(target, damageType, hpLoss);
+    this.accTaken(target, damageType, hpLoss, absorbed, damageType);
 
     // 10) 吸血/回血
     if (seg.kind === 'damage') {
@@ -506,23 +524,24 @@ export class CombatEngine {
       }
     }
 
-    // 11) 装备/被动触发
+    // 11) 装备/被动/天赋触发
     if (seg.canTriggerItems && hpLoss > 0) {
-      this.evaluateEquipment(source, atMs, { kind: 'on_damage_dealt', damageType });
+      this.fireTriggers(source, 'damage_dealt', atMs, { damageType });
       if (meta.sourceKind === 'basic_attack') {
-        this.evaluateEquipment(source, atMs, { kind: 'on_basic_attack_hit' });
-        if (crit) this.evaluateEquipment(source, atMs, { kind: 'on_basic_attack_crit' });
+        this.fireTriggers(source, 'basic_attack_hit', atMs, { damageType });
+        if (crit) this.fireTriggers(source, 'basic_attack_crit', atMs, {});
         this.firePassives(source, 'on_hit', undefined, atMs);
       } else if (meta.sourceKind === 'skill' || meta.sourceKind === 'dot') {
-        this.evaluateEquipment(source, atMs, { kind: 'on_skill_hit', damageType });
+        this.fireTriggers(source, 'skill_hit', atMs, { damageType, skillId: meta.skillId });
         this.firePassives(source, 'on_hit', undefined, atMs);
       }
       this.firePassives(source, 'on_damage_dealt', { damageType }, atMs);
+      if (crit) this.firePassives(source, 'on_basic_attack_crit', undefined, atMs);
     }
 
     // 受击方触发
     if (hpLoss > 0) {
-      this.evaluateEquipment(target, atMs, { kind: 'on_damage_taken' });
+      this.fireTriggers(target, 'damage_taken', atMs, { damageType });
       this.firePassives(target, 'on_damage_taken', undefined, atMs);
       const pct = target.combatant.maxHp > 0 ? (target.combatant.hp / target.combatant.maxHp) * 100 : 0;
       this.evaluateHpBelow(target, atMs, pct);
@@ -532,7 +551,7 @@ export class CombatEngine {
     if (priorAlive && !target.combatant.alive) {
       this.emit('death', source.id, target.id, { targetRemainingHp: 0, description: `${target.combatant.label} 阵亡` });
       if (!target.isDummy) {
-        this.evaluateEquipment(source, atMs, { kind: 'on_kill' });
+        this.fireTriggers(source, 'kill', atMs, {});
         this.firePassives(source, 'on_kill', undefined, atMs);
       }
     }
@@ -577,18 +596,214 @@ export class CombatEngine {
     return { healApplied: applied, overheal: over };
   }
 
-  private gainShield(atMs: number, target: RuntimeCombatant, amount: number, sourceId: CombatantId): void {
-    if (!target.alive || amount <= 0) return;
-    const value = amount * (1 + clampPercent(target.stats.shieldBonus));
-    target.shield = Math.max(target.shield, value);
-    const a = this.accum.get(sourceId)!;
-    a.defense.shieldGenerated += value;
-    this.emit('shield_gain', sourceId, target.id, {
-      shield: value, targetRemainingHp: target.hp, description: `获得护盾 ${f(value)}`,
+  // -------------------------------------------------------------- 护盾系统
+  private totalShield(c: RuntimeCombatant): number {
+    let s = 0;
+    for (const sh of c.shields) s += sh.value;
+    return s;
+  }
+
+  /** 生成护盾：支持类型、刷新规则、优先级、持续时间与护盾事件 */
+  private gainShield(atMs: number, source: Unit, target: Unit, seg: ShieldSegment, meta: SegmentMeta): void {
+    const tgt = target.combatant;
+    if (!tgt.alive) return;
+    if (tgt.maxHp > 0 && this.totalShield(tgt) >= tgt.maxHp * 99) return; // 安全阀，防止极端堆叠溢出
+    const amount = this.evalFormula(source, target, seg.basePower, seg.scaling, atMs);
+    if (amount <= 0) return;
+    const value = amount * (1 + clampPercent(tgt.stats.shieldBonus));
+    const sourceLabel = meta.skillName || meta.itemName || meta.talentName || '护盾';
+    const expMs = seg.durationSeconds > 0 ? atMs + Math.round(seg.durationSeconds * 1000) : 0;
+
+    const acc = this.accum.get(source.id)!;
+    acc.defense.shieldGenerated += value;
+    acc.defense.shieldsGained++;
+    acc.defense.shieldTotal += value;
+    if (value > acc.defense.shieldMaxSingle) acc.defense.shieldMaxSingle = value;
+
+    // 同来源（技能/装备/天赋 + 类型）护盾的刷新规则
+    const key = `${sourceLabel}:${seg.shieldType}`;
+    const existing = tgt.shields.find((s) => `${s.source}:${s.type}` === key);
+    let created: ShieldInstance | null = null;
+    if (existing && seg.refresh !== 'stack') {
+      if (seg.refresh === 'max') {
+        if (existing.value >= value) {
+          // 已有护盾更大，不刷新
+          this.emit('shield_gain', source.id, target.id, {
+            shieldId: existing.id, shieldType: seg.shieldType, shieldSource: sourceLabel,
+            shield: existing.value, targetRemainingHp: tgt.hp,
+            description: `护盾刷新（取最大值）保持 ${f(existing.value)}`,
+          });
+          return;
+        }
+        existing.value = value; existing.maxValue = value; existing.priority = seg.priority;
+        if (expMs) existing.expireTime = expMs;
+        created = existing;
+      } else if (seg.refresh === 'extend') {
+        if (expMs) existing.expireTime = expMs;
+        this.emit('shield_gain', source.id, target.id, {
+          shieldId: existing.id, shieldType: seg.shieldType, shieldSource: sourceLabel,
+          shield: existing.value, targetRemainingHp: tgt.hp,
+          description: `护盾刷新（延续时长）${f(existing.value)}，延时至 ${this.msDisplay(expMs)}`,
+        });
+        return;
+      } else {
+        // overwrite
+        const idx = tgt.shields.indexOf(existing);
+        if (idx >= 0) tgt.shields.splice(idx, 1);
+        created = this.makeShield(tgt, sourceLabel, seg.shieldType, value, atMs, expMs, seg.priority);
+        tgt.shields.push(created);
+      }
+    } else {
+      created = this.makeShield(tgt, sourceLabel, seg.shieldType, value, atMs, expMs, seg.priority);
+      tgt.shields.push(created);
+    }
+
+    this.emit('shield_gain', source.id, target.id, {
+      shieldId: created.id, shieldType: seg.shieldType, shieldSource: sourceLabel,
+      shield: value, targetRemainingHp: tgt.hp,
+      description: `${target.combatant.label}获得${shieldTypeLabel(seg.shieldType)}护盾 ${f(value)}${seg.durationSeconds > 0 ? `（持续 ${seg.durationSeconds}s）` : ''}`,
+    });
+    if (meta?.skillId) this.skillOf(acc, meta.skillId, meta.skillName || '').shield += value;
+    if (meta?.itemId) this.itemOf(acc, meta.itemId, meta.itemName || '').shield += value;
+
+    // 护盾自然消失调度
+    if (expMs > 0) {
+      this.schedule(expMs, () => this.expireShield(target, created.id, atMs, expMs));
+    }
+    // 生成事件触发
+    const ownerUnit = this.units.get(tgt.id);
+    if (ownerUnit?.hero) this.fireTriggers(ownerUnit, 'shield_created', atMs, {});
+  }
+
+  private makeShield(owner: RuntimeCombatant, source: string, type: ShieldType, value: number, nowMs: number, expireMs: number, priority: number): ShieldInstance {
+    return {
+      id: uid('shd'), source, owner: owner.id, type,
+      value, maxValue: value, createTime: nowMs, expireTime: expireMs, priority,
+    };
+  }
+
+  private msDisplay(expMs: number): string {
+    if (expMs <= 0) return '∞';
+    return `${(expMs / 1000).toFixed(1)}s`;
+  }
+
+  private expireShield(owner: Unit, shieldId: string, _createMs: number, expMs: number): void {
+    const c = owner.combatant;
+    const idx = c.shields.findIndex((s) => s.id === shieldId);
+    if (idx < 0) return; // 已被消耗/覆盖
+    const sh = c.shields[idx];
+    if (sh.value <= 0) return;
+    c.shields.splice(idx, 1);
+    const acc = this.accum.get(owner.id)!;
+    acc.defense.shieldExpired++;
+    this.emit('shield_expired', owner.id, owner.id, {
+      shieldId: sh.id, shieldType: sh.type, shieldSource: sh.source,
+      targetRemainingHp: c.hp, description: `${c.label}的${shieldTypeLabel(sh.type)}护盾自然消失`,
+    });
+    this.fireTriggers(owner, 'shield_expired', this.now, {});
+  }
+
+  /**
+   * 将伤害吸收进可吸收的护盾。
+   * 多护盾规则：优先级高者优先，同优先级按生成时间先进先出（FIFO）。
+   * 护盾归零 → 计入被击破，触发 shield_broken。
+   */
+  private absorbIntoShields(atMs: number, target: Unit, damageType: DamageType, amount: number): number {
+    const c = target.combatant;
+    if (amount <= 0 || c.shields.length === 0) return 0;
+    // 可吸收的护盾类型
+    let isAbsorbable: (t: ShieldType) => boolean;
+    if (damageType === 'physical') isAbsorbable = (t) => t === 'all' || t === 'physical';
+    else if (damageType === 'magic') isAbsorbable = (t) => t === 'all' || t === 'magic';
+    else isAbsorbable = (t) => t === 'all'; // true 伤害只进全类型盾
+    const acc = this.accum.get(target.id)!;
+    let remaining = amount;
+    let absorbedTotal = 0;
+    // 排序：priority 高优先，同优先级 createTime 先进先出
+    const usable = c.shields
+      .map((s, i) => ({ s, i }))
+      .filter(({ s }) => isAbsorbable(s.type) && s.value > 0)
+      .sort((a, b) => (b.s.priority - a.s.priority) || (a.s.createTime - b.s.createTime));
+    for (const { s } of usable) {
+      if (remaining <= 0) break;
+      const take = Math.min(s.value, remaining);
+      s.value -= take;
+      remaining -= take;
+      absorbedTotal += take;
+      if (take > 0) {
+        acc.defense.shieldAbsorbed += take;
+        if (s.type === 'physical') acc.defense.physicalShieldAbsorbed += take;
+        else if (s.type === 'magic') acc.defense.magicShieldAbsorbed += take;
+        else acc.defense.allShieldAbsorbed += take;
+        // 受到伤害事件（护盾受苦）
+        const damaged = take > 0;
+        void damaged;
+        this.fireTriggers(target, 'shield_damaged', atMs, {});
+        if (s.value <= 0) {
+          // 击破
+          const idx = c.shields.indexOf(s);
+          if (idx >= 0) c.shields.splice(idx, 1);
+          acc.defense.shieldBroken++;
+          this.emit('shield_broken', target.id, target.id, {
+            shieldId: s.id, shieldType: s.type, shieldSource: s.source,
+            targetRemainingHp: c.hp, description: `${c.label}的${shieldTypeLabel(s.type)}护盾被击破`,
+          });
+          this.fireTriggers(target, 'shield_broken', atMs, {});
+        }
+      }
+    }
+    c.shields = c.shields.filter((s) => s.value > 0);
+    return absorbedTotal;
+  }
+
+  // -------------------------------------------------------------- 冷却减少
+  private reduceCooldowns(atMs: number, source: Unit, seg: CooldownReduceSegment, meta: SegmentMeta): void {
+    const hero = source.hero;
+    if (!hero) return;
+    const reduceMs = Math.max(0, seg.seconds * 1000);
+    if (reduceMs <= 0) return;
+    const triggerSkillId = meta.skillId;
+    const ids = this.reduceScope(source, seg.target, triggerSkillId, seg.skillIds);
+    const applied: string[] = [];
+    for (const id of ids) {
+      const readyAt = hero.skillCds.get(id) ?? 0;
+      if (readyAt <= atMs) continue; // 已在冷却等待完成，无需减少
+      const remaining = readyAt - atMs;
+      const newRemaining = Math.max(0, remaining - reduceMs);
+      hero.skillCds.set(id, atMs + newRemaining);
+      applied.push(id);
+      // 提前就绪事件：使冷却减少实时影响「下一次可释放时间」，而不是等原始就绪事件才释放
+      if (newRemaining < remaining) {
+        const skill = hero.skills.find((s) => s.id === id);
+        if (skill) {
+          this.schedule(atMs + newRemaining, () => this.skillReadyEvent(source, skill, atMs + newRemaining));
+        }
+      }
+    }
+    this.emit('cooldown_reduce', source.id, source.id, {
+      skillId: triggerSkillId,
+      description: `冷却减少：${seg.target === 'SELF_SKILL' ? '该技能' : seg.target === 'OTHER_SKILLS' ? '其他技能' : '所有技能'} ${f(seg.seconds)}s${applied.length ? `（命中 ${applied.length} 个技能）` : ''}`,
     });
   }
 
-  // ---------------------------------------------------------------- 公式
+  private reduceScope(unit: Unit, target: CooldownReduceSegment['target'], triggerSkillId: string | undefined, skillIds?: string[]): string[] {
+    const hero = unit.hero!;
+    const all = hero.skills.filter((s) => s.type === 'active' && s.id !== BASIC_ATTACK_SKILL_MARKER).map((s) => s.id);
+    let pool: string[] = [];
+    if (skillIds && skillIds.length) {
+      pool = skillIds;
+    } else if (target === 'SELF_SKILL') {
+      if (triggerSkillId && triggerSkillId !== BASIC_ATTACK_SKILL_MARKER) pool = [triggerSkillId];
+      else pool = [];
+    } else if (target === 'OTHER_SKILLS') {
+      pool = all.filter((id) => id !== triggerSkillId);
+    } else {
+      pool = all;
+    }
+    return pool;
+  }
+
+  // -------------------------------------------------------------- 公式
   private evalFormula(unit0: Unit, unit1: Unit, base: number, scaling: StatScaling[], _atMs: number): number {
     let value = base || 0;
     for (const s of scaling) value += this.resolveStat(unit0, unit1, s.stat) * s.ratio;
@@ -603,6 +818,7 @@ export class CombatEngine {
       case 'currentHp': return src.currentHp;
       case 'lostHp': return src.maxHp - src.currentHp;
       case 'attack': return src.attack;
+      case 'extraAttack': return src.extraAttack;
       case 'ap': return src.ap;
       case 'armor': return src.armor;
       case 'magicResist': return src.magicResist;
@@ -616,7 +832,7 @@ export class CombatEngine {
     }
   }
 
-  // ---------------------------------------------------------------- 装备触发
+  // -------------------------------------------------------------- 装备触发
   private scheduleIntervalEquipment(owner: Unit): void {
     if (!owner.hero) return;
     for (const item of owner.hero.items) {
@@ -639,17 +855,23 @@ export class CombatEngine {
     for (const item of owner.hero.items) {
       for (const effect of item.effects) {
         if (effect.trigger.kind === 'on_interval') continue;
-        if (!this.triggerMatches(effect.trigger, ctx)) continue;
+        // 兼容旧的专用枚举：on_skill_hit 对应统一事件 skill_hit；on_basic_attack_crit 对应 basic_attack_crit
+        if (effect.trigger.kind === 'on_cast_skill') {
+          if (ctx.kind === 'on_cast_skill') this.triggerEquip(owner, item, effect, atMs);
+          continue;
+        }
+        if (!this.triggerMatches(eventKindOf(effect.trigger.kind), ctx)) continue;
         this.triggerEquip(owner, item, effect, atMs);
       }
     }
   }
 
-  private triggerMatches(trigger: EquipmentTrigger, ctx: { kind: EquipmentTrigger['kind']; damageType?: DamageType }): boolean {
-    if (trigger.kind !== ctx.kind) return false;
-    if (trigger.kind === 'on_skill_hit' || trigger.kind === 'on_damage_dealt') {
-      const dt = (trigger as { damageType?: DamageType }).damageType;
-      if (dt) return dt === ctx.damageType;
+  private triggerMatches(triggerKind: EquipmentTrigger['kind'] | null, ctx: { kind: EquipmentTrigger['kind']; damageType?: DamageType }): boolean {
+    if (!triggerKind) return false;
+    if (triggerKind !== ctx.kind) return false;
+    if (triggerKind === 'on_skill_hit' || triggerKind === 'on_damage_dealt') {
+      const dt = (ctx as { damageType?: DamageType }).damageType;
+      return true;
     }
     return true;
   }
@@ -661,6 +883,14 @@ export class CombatEngine {
         if (effect.trigger.kind !== 'on_hp_below') continue;
         if (hpPercent <= effect.trigger.hpBelowPercent) this.triggerEquip(owner, item, effect, atMs);
       }
+    }
+    // 条件型天赋：生命低于条件触发
+    for (const talent of owner.hero.talents) {
+      if (!talent.trigger) continue;
+      if (talent.trigger.event !== 'hp_below') continue;
+      const cond = talent.trigger.condition;
+      const below = cond && cond.type === 'hpBelow' ? cond.hpBelowPercent : 30;
+      if (hpPercent <= below) this.fireTalent(owner, talent, atMs);
     }
   }
 
@@ -686,7 +916,81 @@ export class CombatEngine {
     }
   }
 
-  // ---------------------------------------------------------------- 被动技能
+  // -------------------------------------------------------------- 统一触发器（Effect Engine）
+  /**
+   * 统一触发器：技能被动、装备效果、天赋触发全部收敛到这里。
+   * event 使用统一 TriggerEvent；同时兼容旧式 PassiveTrigger/EquipmentTrigger 命名（on_*）。
+   */
+  private fireTriggers(unit: Unit, event: TriggerEvent | string, atMs: number, ctx: { damageType?: DamageType; skillId?: string }): void {
+    if (!unit.hero || !unit.combatant.alive) return;
+    // 1) 被动技能
+    this.firePassives(unit, toPassiveKind(event), ctx, atMs);
+    // 2) 装备效果
+    this.evaluateEquipment(unit, atMs, { kind: toEquipKind(event), damageType: ctx.damageType });
+    // 3) 天赋
+    for (const talent of unit.hero.talents) {
+      if (!talent.trigger || talent.type === 'attribute') continue;
+      if (talent.trigger.event !== event) continue;
+      if (!this.conditionMatches(talent, event, ctx)) continue;
+      this.fireTalent(unit, talent, atMs);
+    }
+  }
+
+  private conditionMatches(talent: Talent, event: TriggerEvent | string, ctx: { damageType?: DamageType; skillId?: string }): boolean {
+    const cond = talent.trigger?.condition;
+    if (!cond || cond.type === 'none') return true;
+    if (cond.type === 'damageType') {
+      if (event !== 'damage_dealt' && event !== 'skill_hit' && event !== 'damage_taken') return true;
+      return cond.damageType === ctx.damageType;
+    }
+    return true;
+  }
+
+  private fireTalent(unit: Unit, talent: Talent, atMs: number): void {
+    if (!unit.hero || !unit.combatant.alive) return;
+    const key = `t:${talent.id}`;
+    if (unit.hero.procCds.has(key) && unit.hero.procCds.get(key)! > atMs) return;
+    const target = this.enemyOf(unit.id);
+    this.emit('talent_proc', unit.id, target?.id ?? unit.id, {
+      talentId: talent.id, talentName: talent.name,
+      description: `天赋「${talent.name}」触发`,
+    });
+    if (target) {
+      for (const seg of talent.effects) {
+        this.scheduleSegment(atMs, unit, target, seg, {
+          sourceKind: 'skill', sourceType: 'talent',
+          talentId: talent.id, talentName: talent.name,
+        });
+      }
+    }
+  }
+
+  private fireCombatStartTalents(unit: Unit): void {
+    if (!unit.hero) return;
+    for (const talent of unit.hero.talents) {
+      if (talent.type === 'attribute' || !talent.trigger) continue;
+      const event = talent.trigger.event;
+      if (event === 'combat_start') this.fireTalent(unit, talent, this.now);
+    }
+  }
+
+  private scheduleIntervalTalents(unit: Unit): void {
+    if (!unit.hero) return;
+    for (const talent of unit.hero.talents) {
+      if (!talent.trigger || talent.trigger.event !== 'interval') continue;
+      const cond = talent.trigger.condition;
+      const every = (cond && cond.type === 'every' ? cond.everySeconds : 1) * 1000;
+      this.schedule(this.now + every, () => this.fireIntervalTalent(unit, talent, every, this.now + every));
+    }
+  }
+
+  private fireIntervalTalent(unit: Unit, talent: Talent, every: number, atMs: number): void {
+    if (!unit.hero || !unit.combatant.alive) return;
+    this.fireTalent(unit, talent, atMs);
+    this.schedule(atMs + every, () => this.fireIntervalTalent(unit, talent, every, atMs + every));
+  }
+
+  // -------------------------------------------------------------- 被动技能（兼容旧式）
   private fireCombatStartPassives(unit: Unit): void {
     if (!unit.hero) return;
     for (const skill of unit.hero.skills) {
@@ -717,6 +1021,7 @@ export class CombatEngine {
       skillId: skill.id, skillName: skill.name, description: `被动「${skill.name}」触发`,
     });
     this.skillOf(this.accum.get(unit.id)!, skill.id, skill.name).cast++;
+    this.fireTriggers(unit, 'cast_skill', atMs, { skillId: skill.id });
     if (target) {
       for (const seg of skill.segments) {
         this.scheduleSegment(atMs, unit, target, seg, {
@@ -741,7 +1046,7 @@ export class CombatEngine {
     }
   }
 
-  // ---------------------------------------------------------------- 统计
+  // -------------------------------------------------------------- 统计
   private skillOf(acc: RunAccum, id: string, name: string) {
     let s = acc.skills.get(id);
     if (!s) { s = { id, name, cast: 0, hits: 0, dmg: 0, crits: 0, heal: 0, shield: 0 }; acc.skills.set(id, s); }
@@ -780,16 +1085,18 @@ export class CombatEngine {
     }
   }
 
-  private accTaken(target: Unit, damageType: DamageType, landed: number): void {
+  private accTaken(target: Unit, damageType: DamageType, landed: number, absorbed: number, dmgType: DamageType): void {
     const acc = this.accum.get(target.id)!;
     const D = acc.defense;
     D.damageTaken += landed;
     D.physicalTaken += damageType === 'physical' ? landed : 0;
     D.magicTaken += damageType === 'magic' ? landed : 0;
     D.trueTaken += damageType === 'true' ? landed : 0;
+    // 护盾吸收量在吸吸收环节已计入 shieldAbsorbed 与分类型
+    void absorbed; void dmgType;
   }
 
-  // ---------------------------------------------------------------- 结果
+  // -------------------------------------------------------------- 结果
   private buildResult(): CombatResult {
     const results: CombatResult['results'] = [];
     for (const unit of this.units.values()) {
@@ -812,13 +1119,13 @@ export class CombatEngine {
       });
     }
     const snapshot: CombatSnapshot = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       config: this.config,
-      combatants: [...this.units.values()].map((u) => ({ ...u.combatant, stats: { ...u.combatant.stats } })),
-      simVersion: '0.1.0',
+      combatants: [...this.units.values()].map((u) => ({ ...u.combatant, stats: { ...u.combatant.stats }, shields: u.combatant.shields.map((s) => ({ ...s })) })),
+      simVersion: '0.2.0',
     };
     return {
-      schemaVersion: 1,
+      schemaVersion: 2,
       config: this.config,
       snapshot,
       events: this.events,
@@ -834,4 +1141,66 @@ export class CombatEngine {
 /** 入口：运行一次战斗 */
 export function runCombat(config: CombatConfig, equipmentById: Map<string, Equipment>): CombatResult {
   return new CombatEngine(config, equipmentById).run();
+}
+
+// ---------------------------------------------------------------- 枚举映射
+/** 统一 TriggerEvent → 旧式 PassiveTrigger.kind */
+function toPassiveKind(event: TriggerEvent | string): PassivePollKind {
+  switch (event) {
+    case 'basic_attack_hit': return 'on_basic_attack_hit';
+    case 'basic_attack_crit': return 'on_basic_attack_crit';
+    case 'skill_hit': return 'on_skill_hit';
+    case 'damage_dealt': return 'on_damage_dealt';
+    case 'damage_taken': return 'on_damage_taken';
+    case 'kill': return 'on_kill';
+    case 'cast_skill': return 'on_cast_skill';
+    case 'shield_created': return 'on_shield_created';
+    case 'shield_damaged': return 'on_shield_damaged';
+    case 'shield_broken': return 'on_shield_broken';
+    case 'shield_expired': return 'on_shield_expired';
+    case 'on_attack':
+    case 'on_hit':
+    case 'on_basic_attack_hit':
+    case 'on_basic_attack_crit':
+    case 'on_damage_dealt':
+    case 'on_damage_taken':
+    case 'on_kill':
+      return event as PassivePollKind;
+    default: return 'on_hit';
+  }
+}
+
+/** 统一 TriggerEvent → 旧式 EquipmentTrigger.kind */
+function toEquipKind(event: TriggerEvent | string): EquipmentTrigger['kind'] {
+  switch (event) {
+    case 'basic_attack_hit': return 'on_basic_attack_hit';
+    case 'basic_attack_crit': return 'on_basic_attack_crit';
+    case 'skill_hit': return 'on_skill_hit';
+    case 'damage_dealt': return 'on_damage_dealt';
+    case 'damage_taken': return 'on_damage_taken';
+    case 'kill': return 'on_kill';
+    case 'cast_skill': return 'on_cast_skill';
+    case 'shield_created': return 'on_shield_created';
+    case 'shield_damaged': return 'on_shield_damaged';
+    case 'shield_broken': return 'on_shield_broken';
+    case 'shield_expired': return 'on_shield_expired';
+    case 'on_basic_attack_hit':
+    case 'on_basic_attack_crit':
+    case 'on_skill_hit':
+    case 'on_damage_dealt':
+    case 'on_damage_taken':
+    case 'on_kill':
+    case 'on_cast_skill':
+    case 'on_shield_created':
+    case 'on_shield_damaged':
+    case 'on_shield_broken':
+    case 'on_shield_expired':
+      return event as EquipmentTrigger['kind'];
+    default: return 'on_damage_taken';
+  }
+}
+
+/** 任意触发事件 kind → 设备触发 kind（供 triggerMatches 使用） */
+function eventKindOf(kind: EquipmentTrigger['kind']): EquipmentTrigger['kind'] | null {
+  return kind;
 }

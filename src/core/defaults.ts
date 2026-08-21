@@ -1,7 +1,7 @@
 /** 默认数据工厂：新建空模板时采用，保证字段不为空、不崩 */
 import {
   type CombatConfig, type DummyConfig, type Equipment, type EquipmentEffect,
-  type Hero, type HeroStats, type Skill, emptyStats,
+  type Hero, type HeroStats, type Skill, type Talent, type TalentBook, emptyStats,
 } from './types';
 
 export function uid(prefix = ''): string {
@@ -19,6 +19,7 @@ export function newHero(): Hero {
     baseStats: emptyStats(),
     skills: [],
     defaultItems: [],
+    talents: [],
   };
 }
 
@@ -83,15 +84,65 @@ export function newDummy(config?: Partial<DummyConfig>): DummyConfig {
   };
 }
 
+/** 新建天赋模板 */
+export function newTalent(): Talent {
+  return {
+    id: uid('talent'),
+    name: '新天赋',
+    description: '',
+    icon: '',
+    type: 'attribute',
+    heroId: null,
+    statBonus: { attack: 20 },
+    effects: [],
+  };
+}
+
+/** 新建天赋页（方案） */
+export function newTalentBook(): TalentBook {
+  return {
+    id: uid('tb'),
+    name: '新天赋页',
+    description: '',
+    talentIds: [],
+  };
+}
+
+/** 一段标准护盾片段（含类型/刷新/优先级） */
+export function shieldSegmentFactory(basePower: number, durationSeconds = 0): import('./types').ShieldSegment {
+  return {
+    kind: 'shield',
+    delaySeconds: 0,
+    basePower,
+    scaling: [],
+    durationSeconds,
+    shieldType: 'all',
+    refresh: 'overwrite',
+    priority: 0,
+  };
+}
+
+/** 一段标准冷却减少片段 */
+export function cooldownReduceSegmentFactory(seconds = 1, target: import('./types').CooldownTarget = 'ALL_SKILLS'): import('./types').CooldownReduceSegment {
+  return {
+    kind: 'cooldown_reduce',
+    delaySeconds: 0,
+    target,
+    seconds,
+    allowOvershoot: false,
+  };
+}
+
 /** 初始化一份可用的 CombatConfig */
 export function newCombatConfig(partial?: Partial<CombatConfig>): CombatConfig {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     mode: 'dummy',
     durationSeconds: 30,
     randomMode: 'seeded',
     seed: 12345,
     trueDamageIgnoresReduction: true,
+    trueDamageAffectsShield: false,
     combos: [],
     dummy: newDummy(),
     skillPriority: {},

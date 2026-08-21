@@ -7,11 +7,11 @@ import { buildCombatConfig } from '../core/combatConfig';
 import { Card, NumberField, SelectField, StatBox, ToggleField, num, pct, fmtTime } from '../components/ui';
 import { LineChart, ShareBars } from '../components/charts';
 import { damageShare, damageTypeShare, dpsUpTo, avgDps } from '../core/stats';
-import type { CombatConfig, CombatantId, CombatResult, Hero } from '../core/types';
+import type { CombatConfig, CombatantId, CombatResult, Hero, Talent } from '../core/types';
 import { MAX_EQUIPMENT } from '../core/types';
 
 export function Combat() {
-  const { heroes, equipment, result, running, setCombatConfig, runSimulation, saveSimulation, clearResult } = useAppStore();
+  const { heroes, equipment, talents, result, running, setCombatConfig, runSimulation, saveSimulation, clearResult } = useAppStore();
 
   const [mode, setMode] = useState<'dummy' | 'vs'>('dummy');
   const [duration, setDuration] = useState(30);
@@ -19,8 +19,10 @@ export function Combat() {
   const [seed, setSeed] = useState(12345);
   const [heroAId, setHeroAId] = useState<string>('');
   const [itemsA, setItemsA] = useState<string[]>([]);
+  const [talentsA, setTalentsA] = useState<string[]>([]);
   const [heroBId, setHeroBId] = useState<string>('');
   const [itemsB, setItemsB] = useState<string[]>([]);
+  const [talentsB, setTalentsB] = useState<string[]>([]);
   const [dummy, setDummy] = useState({ infiniteHp: true, maxHp: 10000, armor: 30, magicResist: 30, damageReduction: 0 });
 
   const heroA = useMemo(() => heroes.find((x) => x.id === heroAId) ?? null, [heroes, heroAId]);
@@ -35,9 +37,11 @@ export function Combat() {
       seed,
       heroA,
       itemsA,
+      talentsA: resolveTalents(talents, talentsA, heroA.id),
       labelA: heroA.name,
       heroB: mode === 'vs' ? heroB ?? undefined : undefined,
       itemsB,
+      talentsB: heroB ? resolveTalents(talents, talentsB, heroB.id) : undefined,
       labelB: heroB?.name,
       dummy,
       skillPriorityA: heroA.skills.map((s) => s.id),
@@ -53,7 +57,7 @@ export function Combat() {
     <div>
       <div className="combat-cols">
         <Card title="英雄 A">
-          <HeroSetupPanel label="英雄 A" heroes={heroes} equipment={equipment} heroId={heroAId} onHeroId={setHeroAId} items={itemsA} onItems={setItemsA} />
+          <HeroSetupPanel label="英雄 A" heroes={heroes} equipment={equipment} talents={talents} heroId={heroAId} onHeroId={setHeroAId} items={itemsA} onItems={setItemsA} selectedTalents={talentsA} onTalents={setTalentsA} />
         </Card>
 
         <Card title="战斗设置">
@@ -79,7 +83,7 @@ export function Combat() {
               </div>
             </div>
           ) : (
-            <HeroSetupPanel label="英雄 B" heroes={heroes} equipment={equipment} heroId={heroBId} onHeroId={setHeroBId} items={itemsB} onItems={setItemsB} />
+            <HeroSetupPanel label="英雄 B" heroes={heroes} equipment={equipment} talents={talents} heroId={heroBId} onHeroId={setHeroBId} items={itemsB} onItems={setItemsB} selectedTalents={talentsB} onTalents={setTalentsB} />
           )}
         </Card>
       </div>
@@ -89,14 +93,18 @@ export function Combat() {
   );
 }
 
-function HeroSetupPanel({ label, heroes, equipment, heroId, onHeroId, items, onItems }: {
-  label?: string; heroes: Hero[]; equipment: { id: string; name: string }[]; heroId: string;
+function HeroSetupPanel({ label, heroes, equipment, talents, heroId, onHeroId, items, onItems, selectedTalents, onTalents }: {
+  label?: string; heroes: Hero[]; equipment: { id: string; name: string }[]; talents: Talent[]; heroId: string;
   onHeroId: (id: string) => void; items: string[]; onItems: (ids: string[]) => void; compact?: boolean;
+  selectedTalents: string[]; onTalents: (ids: string[]) => void;
 }) {
   const setSlot = (i: number, id: string) => {
     const next = [...items]; next[i] = id;
     onItems(next.filter(Boolean).slice(0, MAX_EQUIPMENT));
   };
+  // 可选天赋：通用（heroId=null）+ 该英雄专属
+  const available = talents.filter((x) => !x.heroId || x.heroId === heroId);
+  const toggleTalent = (id: string) => onTalents(selectedTalents.includes(id) ? selectedTalents.filter((x) => x !== id) : [...selectedTalents, id]);
   return (
     <div>
       <label className="field"><span>选择英雄</span>
@@ -127,11 +135,34 @@ function HeroSetupPanel({ label, heroes, equipment, heroId, onHeroId, items, onI
               );
             })}
           </div>
+
+          <div className="section-label">天赋</div>
+          <div className="row" style={{ flexWrap: 'wrap', gap: 6, marginBottom: 4 }}>
+            {selectedTalents.map((id) => {
+              const t = talents.find((x) => x.id === id);
+              if (!t) return null;
+              return <span key={id} className="badge" style={{ cursor: 'pointer' }} onClick={() => toggleTalent(id)}>{t.name} ✕</span>;
+            })}
+            {!selectedTalents.length && <span className="muted" style={{ fontSize: 12 }}>未选择天赋</span>}
+          </div>
+          {available.length > 0 && (
+            <select value="" onChange={(e) => { if (e.target.value) toggleTalent(e.target.value); }} style={{ fontSize: 12, padding: '4px 5px', width: '100%' }}>
+              <option value="">＋ 添加天赋…</option>
+              {available.filter((x) => !selectedTalents.includes(x.id)).map((x) => <option key={x.id} value={x.id}>{x.name}{x.heroId ? '（专属）' : ''}</option>)}
+            </select>
+          )}
         </>
       )}
       {!heroId && <p className="muted" style={{ fontSize: 12, marginTop: 8 }}>未选择英雄。</p>}
     </div>
   );
+}
+
+/** 将选中的天赋 id 解析为完整 Talent 对象（供引擎加载） */
+function resolveTalents(pool: Talent[], ids: string[], heroId: string): Talent[] {
+  return ids
+    .map((id) => pool.find((x) => x.id === id))
+    .filter((x): x is Talent => !!x && (!x.heroId || x.heroId === heroId));
 }
 
 function ResultView({ result, onSave, onClear }: { result: CombatResult; onSave: () => void; onClear: () => void }) {

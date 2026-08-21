@@ -10,7 +10,7 @@
  *  - 攻击间隔 / 冷却时长以「秒」存储（引擎内转毫秒）
  */
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 // ---------------------------------------------------------------------------
 // 基础枚举
@@ -31,11 +31,75 @@ export type SimMode = 'dummy' | 'vs';
 /** 随机模式：seeded=按种子抽样复现；expectation=按数学期望不抽样 */
 export type RandomMode = 'seeded' | 'expectation';
 
-/** 一段效果的类型：伤害 / 持续伤害(Dot) / 治疗 / 护盾 */
-export type EffectSegmentKind = 'damage' | 'dot' | 'heal' | 'shield';
+/** 一段效果的类型：伤害 / 持续伤害(Dot) / 治疗 / 护盾 / 冷却减少 */
+export type EffectSegmentKind = 'damage' | 'dot' | 'heal' | 'shield' | 'cooldown_reduce';
 
 /** 伤害来源（用于伤害构成拆分） */
 export type DamageSourceKind = 'basic_attack' | 'skill' | 'item' | 'dot';
+
+/**
+ * 统一触发-效果-参数（Trigger + Effect + Parameter）机制的事件类型。
+ * 所有技能被动 / 装备效果 / 天赋触发统一走该枚举，禁止针对单一对象写死逻辑。
+ */
+export type TriggerEvent =
+  /** 释放技能（主动释放 / 被动触发） */
+  | 'cast_skill'
+  /** 技能命中 */
+  | 'skill_hit'
+  /** 普通攻击命中 */
+  | 'basic_attack_hit'
+  /** 普通攻击暴击 */
+  | 'basic_attack_crit'
+  /** 造成伤害 */
+  | 'damage_dealt'
+  /** 击杀目标 */
+  | 'kill'
+  /** 受到伤害 */
+  | 'damage_taken'
+  /** 生命值低于条件 */
+  | 'hp_below'
+  /** 战斗开始 */
+  | 'combat_start'
+  /** 固定间隔 */
+  | 'interval'
+  /** 护盾生成 */
+  | 'shield_created'
+  /** 护盾受到伤害 */
+  | 'shield_damaged'
+  /** 护盾被击破 */
+  | 'shield_broken'
+  /** 护盾时间结束消失 */
+  | 'shield_expired';
+
+/** 触发条件（Key 值，默认无附加条件） */
+export type TriggerConditionKind =
+  | { type: 'none' }
+  | { type: 'damageType'; damageType: DamageType }
+  | { type: 'hpBelow'; hpBelowPercent: number }
+  | { type: 'every'; everySeconds: number };
+
+/** 触发抽象模型：事件 + 条件 */
+export interface Trigger {
+  event: TriggerEvent;
+  condition?: TriggerConditionKind;
+}
+
+// ---------------------------------------------------------------------------
+// 统一效果（Effect）抽象模型
+//
+// 每个「效果」= id + 类型 + 参数。所有技能 / 装备 / 天赋的被执行效果统一表示为
+// Effect（底层由 EffectSegment 承载），由 Effect Engine 统一解析执行。
+// ---------------------------------------------------------------------------
+
+/** 效果类型（与 EffectSegment.kind 对齐） */
+export type EffectType = 'damage' | 'dot' | 'heal' | 'shield' | 'cooldown_reduce';
+
+/** 通用效果模型（数据层描述；可执行解析见 EffectSegment / ShieldInstance） */
+export interface Effect {
+  id: string;
+  type: EffectType;
+  params: Record<string, unknown>;
+}
 
 // ---------------------------------------------------------------------------
 // 属性系统
@@ -52,6 +116,8 @@ export interface HeroStats {
   currentHp: number;
   /** 攻击力 */
   attack: number;
+  /** 额外攻击力（运行时 = 最终攻击 - 基础攻击；供「额外攻击力」倍率引用） */
+  extraAttack: number;
   /** 法强 */
   ap: number;
   /** 护甲 */
@@ -111,7 +177,7 @@ export interface HeroStats {
 /** 属性键（用于公式倍率引用自身/目标属性） */
 export type StatKey =
   | 'maxHp' | 'currentHp' | 'lostHp'
-  | 'attack' | 'ap' | 'armor' | 'magicResist' | 'moveSpeed'
+  | 'attack' | 'extraAttack' | 'ap' | 'armor' | 'magicResist' | 'moveSpeed'
   | 'targetMaxHp' | 'targetCurrentHp' | 'targetLostHp'
   | 'targetAttack' | 'targetAp';
 
@@ -188,6 +254,12 @@ export interface HealSegment {
   scaling: StatScaling[];
 }
 
+/** 护盾类型：物理 / 魔法 / 全类型 */
+export type ShieldType = 'physical' | 'magic' | 'all';
+
+/** 护盾刷新规则：覆盖 / 叠加 / 取最大值 / 延长时间 */
+export type ShieldRefreshRule = 'overwrite' | 'stack' | 'max' | 'extend';
+
 /** 护盾效果 */
 export interface ShieldSegment {
   kind: 'shield';
@@ -198,10 +270,38 @@ export interface ShieldSegment {
   scaling: StatScaling[];
   /** 持续时长（秒）；0 表示永久直到被消耗 */
   durationSeconds: number;
+  /** 护盾类型（决定可吸收哪些伤害） */
+  shieldType: ShieldType;
+  /** 再次获得同来源护盾时的刷新规则 */
+  refresh: ShieldRefreshRule;
+  /** 护盾优先级（越大越优先被消耗；默认同优先级按先进先出） */
+  priority: number;
+}
+
+// ---------------------------------------------------------------------------
+// 冷却减少效果
+// ---------------------------------------------------------------------------
+
+/** 冷却减少的目标范围 */
+export type CooldownTarget = 'SELF_SKILL' | 'OTHER_SKILLS' | 'ALL_SKILLS';
+
+/** 冷却减少效果：减少目标技能范围 N 秒冷却 */
+export interface CooldownReduceSegment {
+  kind: 'cooldown_reduce';
+  /** 延迟（秒） */
+  delaySeconds: number;
+  /** 目标技能范围 */
+  target: CooldownTarget;
+  /** 减少的冷却秒数 */
+  seconds: number;
+  /** 是否允许超过当前剩余冷却（false＝剩余 2s 减 5s 结果=0；true＝可减到负数为 0） */
+  allowOvershoot: boolean;
+  /** 可选：限定命中技能 id（为空则按 target 作用全部） */
+  skillIds?: string[];
 }
 
 /** 效果片段的联合类型 */
-export type EffectSegment = DamageSegment | DotSegment | HealSegment | ShieldSegment;
+export type EffectSegment = DamageSegment | DotSegment | HealSegment | ShieldSegment | CooldownReduceSegment;
 
 // ---------------------------------------------------------------------------
 // 技能系统
@@ -213,13 +313,21 @@ export type SkillType = 'active' | 'passive';
 /** 被动触发条件 */
 export type PassiveTrigger =
   | { kind: 'on_basic_attack_hit' }
+  | { kind: 'on_basic_attack_crit' }
   | { kind: 'on_attack' }
   | { kind: 'on_hit' }
+  | { kind: 'on_cast_skill' }
+  | { kind: 'on_skill_hit'; damageType?: DamageType }
   | { kind: 'on_damage_dealt'; damageType?: DamageType }
   | { kind: 'on_damage_taken' }
+  | { kind: 'on_hp_below'; hpBelowPercent: number }
   | { kind: 'on_combat_start' }
   | { kind: 'on_interval'; everySeconds: number }
-  | { kind: 'on_kill' };
+  | { kind: 'on_kill' }
+  | { kind: 'on_shield_created' }
+  | { kind: 'on_shield_damaged' }
+  | { kind: 'on_shield_broken' }
+  | { kind: 'on_shield_expired' };
 
 export interface Skill {
   id: string;
@@ -255,13 +363,18 @@ export const BASIC_ATTACK_SKILL_MARKER = '__basic_attack__';
 export type EquipmentTrigger =
   | { kind: 'on_basic_attack_hit' }
   | { kind: 'on_basic_attack_crit' }
+  | { kind: 'on_cast_skill' }
   | { kind: 'on_skill_hit'; damageType?: DamageType }
   | { kind: 'on_damage_dealt'; damageType?: DamageType }
   | { kind: 'on_damage_taken' }
   | { kind: 'on_hp_below'; hpBelowPercent: number }
   | { kind: 'on_combat_start' }
   | { kind: 'on_interval'; everySeconds: number }
-  | { kind: 'on_kill' };
+  | { kind: 'on_kill' }
+  | { kind: 'on_shield_created' }
+  | { kind: 'on_shield_damaged' }
+  | { kind: 'on_shield_broken' }
+  | { kind: 'on_shield_expired' };
 
 /** 触发限制：内部冷却 */
 export interface ProcLimit {
@@ -309,6 +422,8 @@ export interface Hero {
   skills: Skill[];
   /** 默认装备方案（装备 id 列表，最多 MAX_EQUIPMENT） */
   defaultItems: string[];
+  /** 绑定天赋（英雄专属天赋模板 id 列表） */
+  talents: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -326,6 +441,39 @@ export interface DummyConfig {
 }
 
 // ---------------------------------------------------------------------------
+// 天赋系统
+// ---------------------------------------------------------------------------
+
+/** 天赋类型 */
+export type TalentType = 'attribute' | 'passive' | 'triggered' | 'conditional';
+
+/** 天赋：Trigger + Effect + Parameter 的封装，可复用装备/技能效果系统 */
+export interface Talent {
+  id: string;
+  name: string;
+  description: string;
+  icon?: string;
+  type: TalentType;
+  /** 绑定英雄：null 表示通用天赋（所有英雄可选）；否则为指定 heroId 专属天赋 */
+  heroId: string | null;
+  /** 属性型天赋：直接加成的属性（战斗开始时合并进面板） */
+  statBonus?: Partial<HeroStats>;
+  /** 触发条件（被动/触发/条件型天赋使用） */
+  trigger?: Trigger;
+  /** 执行的效果片段（与装备/技能效果复用同一套参数化机制） */
+  effects: EffectSegment[];
+}
+
+/** 天赋页（方案）：选择一组天赋的组合，进入战斗前加载 */
+export interface TalentBook {
+  id: string;
+  name: string;
+  description?: string;
+  /** 已选中天赋 id 列表（有序） */
+  talentIds: string[];
+}
+
+// ---------------------------------------------------------------------------
 // 战斗配置
 // ---------------------------------------------------------------------------
 
@@ -333,6 +481,8 @@ export interface CombatantConfig {
   label: string;
   hero: Hero;
   itemIds: string[]; // <= MAX_EQUIPMENT
+  /** 本英雄佩戴的天赋（已解析为完整对象，便于战斗隔离） */
+  talents: Talent[];
 }
 
 export interface CombatConfig {
@@ -345,6 +495,8 @@ export interface CombatConfig {
   seed?: number;
   /** 真实伤害是否受「伤害减免」影响 */
   trueDamageIgnoresReduction: boolean;
+  /** 真实伤害是否可以被「全类型护盾」吸收（false＝真实伤害无视护盾直接扣生命） */
+  trueDamageAffectsShield: boolean;
   combos: CombatantConfig[];
   /** 模式为 dummy 时生效 */
   dummy: DummyConfig;
@@ -367,6 +519,27 @@ export interface CombatSnapshot {
 
 export type CombatantId = 'A' | 'B' | 'dummy';
 
+/**
+ * 运行时护盾实例：每个独立护盾单独记录（类型/来源/数值/时长/优先级）。
+ * 符合「护盾系统扩展」要求：带 id、来源、类型、现值/初值、生成/结束时间。
+ */
+export interface ShieldInstance {
+  id: string;
+  /** 来源标签（技能/装备/天赋名） */
+  source: string;
+  owner: CombatantId;
+  type: ShieldType;
+  /** 当前剩余护盾值 */
+  value: number;
+  /** 初始护盾值 */
+  maxValue: number;
+  /** 生成时间（毫秒） */
+  createTime: number;
+  /** 自然结束时间（毫秒）；0 表示永久 */
+  expireTime: number;
+  priority: number;
+}
+
 /** 引擎内的战斗实体：属性已合并装备、生命值为运行时状态 */
 export interface RuntimeCombatant {
   id: CombatantId;
@@ -378,9 +551,8 @@ export interface RuntimeCombatant {
   maxHp: number;
   hp: number;
   alive: boolean;
-  /** 盾条（护盾对下一次伤害先吸收） */
-  shield: number;
-  shieldSourceId?: string;
+  /** 运行时护盾实例列表（多护盾按类型/存储吸收） */
+  shields: ShieldInstance[];
   /** 累积承伤统计（引擎内即时累计，用于曲线） */
   _uiDamageTaken?: number;
 }
@@ -394,12 +566,16 @@ export type EventType =
   | 'basic_attack'
   | 'skill_cast'
   | 'item_proc'
+  | 'talent_proc'
   | 'dot_tick'
   | 'damage'
   | 'crit'
   | 'heal'
   | 'shield_gain'
   | 'shield_absorbed'
+  | 'shield_broken'
+  | 'shield_expired'
+  | 'cooldown_reduce'
   | 'death'
   | 'cooldown_ready'
   | 'combat_end';
@@ -415,6 +591,13 @@ export interface CombatEvent {
   skillName?: string;
   itemId?: string;
   itemName?: string;
+  /** 天赋触发专属字段 */
+  talentId?: string;
+  talentName?: string;
+  /** 护盾事件专属字段 */
+  shieldId?: string;
+  shieldType?: ShieldType;
+  shieldSource?: string;
   /* --- 伤害相关 --- */
   damageType?: DamageType;
   /** 抗性减免前的伤害（已含增伤与暴击） */
@@ -476,6 +659,22 @@ export interface DefenseStat {
   trueTaken: number;
   shieldAbsorbed: number;
   shieldGenerated: number;
+  /** 获得护盾次数 */
+  shieldsGained: number;
+  /** 总护盾量（各次护盾初始值之和） */
+  shieldTotal: number;
+  /** 最大单次护盾 */
+  shieldMaxSingle: number;
+  /** 物理护盾吸收量 */
+  physicalShieldAbsorbed: number;
+  /** 魔法护盾吸收量 */
+  magicShieldAbsorbed: number;
+  /** 全类型护盾吸收量 */
+  allShieldAbsorbed: number;
+  /** 护盾被击破次数 */
+  shieldBroken: number;
+  /** 护盾自然消失次数 */
+  shieldExpired: number;
 }
 
 export interface PerSkillStat {
@@ -584,6 +783,18 @@ export interface SkillTemplate {
   data: Skill;
 }
 
+export interface TalentTemplate {
+  kind: 'talent';
+  schemaVersion: number;
+  data: Talent;
+}
+
+export interface TalentBookTemplate {
+  kind: 'talentBook';
+  schemaVersion: number;
+  data: TalentBook;
+}
+
 export interface BattlePreset {
   id: string;
   name: string;
@@ -604,6 +815,8 @@ export type AnyTemplate =
   | HeroTemplate
   | EquipmentTemplate
   | SkillTemplate
+  | TalentTemplate
+  | TalentBookTemplate
   | BattlePresetTemplate;
 
 /** 备份文件整体结构 */
@@ -614,6 +827,8 @@ export interface BackupFile {
   heroes: Hero[];
   equipment: Equipment[];
   skills: Skill[];
+  talents: Talent[];
+  talentBooks: TalentBook[];
   battlePresets: BattlePreset[];
   savedSimulations: SavedSimulation[];
 }
@@ -624,6 +839,7 @@ export function emptyStats(): HeroStats {
     maxHp: 1000,
     currentHp: 1000,
     attack: 100,
+    extraAttack: 0,
     ap: 0,
     armor: 30,
     magicResist: 30,

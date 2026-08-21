@@ -3,7 +3,7 @@
  */
 import {
   type CombatantConfig, type CombatConfig, type CombatantId,
-  type Equipment, type Hero, type HeroStats, type RuntimeCombatant,
+  type Equipment, type Hero, type HeroStats, type RuntimeCombatant, type Talent,
   emptyStats,
 } from '../types';
 
@@ -24,6 +24,19 @@ export function mergeStats(base: HeroStats, items: Equipment[]): HeroStats {
   return out;
 }
 
+/** 合并天赋属性加成（属性型天赋 statBonus） */
+export function applyTalentBuffs(stats: HeroStats, talents: Talent[]): void {
+  for (const t of talents || []) {
+    if (!t.statBonus) continue;
+    for (const k of Object.keys(t.statBonus) as Array<keyof HeroStats>) {
+      const v = t.statBonus[k];
+      if (typeof v === 'number') {
+        stats[k] = stats[k] + v;
+      }
+    }
+  }
+}
+
 /** 由 CombatantConfig + 装备库构建运行时战斗实体（英雄） */
 export function buildHeroCombatant(
   id: CombatantId,
@@ -37,6 +50,12 @@ export function buildHeroCombatant(
     if (it) items.push(it);
   }
   const stats = mergeStats(cfg.hero.baseStats, items);
+  const baseAttack = cfg.hero.baseStats.attack || 0;
+  stats.extraAttack = stats.attack - baseAttack;
+  applyTalentBuffs(stats, cfg.talents || []);
+  // 天赋可能加成生命上限，同步满血
+  stats.maxHp = Math.max(1, stats.maxHp);
+  stats.currentHp = stats.maxHp;
   return {
     id, label,
     isDummy: false, isHero: true,
@@ -44,7 +63,7 @@ export function buildHeroCombatant(
     maxHp: stats.maxHp,
     hp: stats.currentHp,
     alive: hpAlive(stats.currentHp),
-    shield: 0,
+    shields: [],
   };
 }
 
@@ -62,7 +81,7 @@ export function buildDummyCombatant(
   const c: RuntimeCombatant = {
     id: 'dummy', label: '木桩',
     isDummy: true, isHero: false,
-    stats, maxHp: stats.maxHp, hp: stats.maxHp, alive: true, shield: 0,
+    stats, maxHp: stats.maxHp, hp: stats.maxHp, alive: true, shields: [],
   };
   return applyEquipmentProcsAtStart(c, equipmentById);
 }

@@ -2,8 +2,8 @@
  * 效果片段编辑器：一段伤害/Dot/治疗/护盾的编辑，含参数化倍率(stat × ratio)。
  * 技能与装备效果共用，避免重复。
  */
-import type { DamageSegment, DotSegment, EffectSegment, HealSegment, ShieldSegment, StatKey, StatScaling } from '../core/types';
-import { damageSegmentFactory } from '../core/defaults';
+import type { CooldownReduceSegment, DamageSegment, DotSegment, EffectSegment, HealSegment, ShieldSegment, StatKey, StatScaling } from '../core/types';
+import { damageSegmentFactory, cooldownReduceSegmentFactory, shieldSegmentFactory } from '../core/defaults';
 import { NumberField, SelectField, ToggleField, SectionLabel } from './ui';
 
 const STAT_OPTIONS: Array<{ value: StatKey; label: string }> = [
@@ -11,6 +11,7 @@ const STAT_OPTIONS: Array<{ value: StatKey; label: string }> = [
   { value: 'currentHp', label: '自身当前生命' },
   { value: 'lostHp', label: '自身已损失生命' },
   { value: 'attack', label: '自身攻击力' },
+  { value: 'extraAttack', label: '自身额外攻击力' },
   { value: 'ap', label: '自身法强' },
   { value: 'armor', label: '自身护甲' },
   { value: 'magicResist', label: '自身魔抗' },
@@ -25,6 +26,25 @@ const DAMAGE_TYPES = [
   { value: 'physical', label: '物理伤害' },
   { value: 'magic', label: '魔法伤害' },
   { value: 'true', label: '真实伤害' },
+];
+
+const SHIELD_TYPES = [
+  { value: 'all', label: '全类型护盾' },
+  { value: 'physical', label: '物理护盾' },
+  { value: 'magic', label: '魔法护盾' },
+];
+
+const SHIELD_REFRESH = [
+  { value: 'overwrite', label: '覆盖（旧护盾消失）' },
+  { value: 'stack', label: '叠加（累加数值）' },
+  { value: 'max', label: '取最大值' },
+  { value: 'extend', label: '延长时间' },
+];
+
+const COOLDOWN_TARGET = [
+  { value: 'SELF_SKILL', label: '当前技能' },
+  { value: 'OTHER_SKILLS', label: '其他技能' },
+  { value: 'ALL_SKILLS', label: '所有技能' },
 ];
 
 export function ScalingRows({ scaling, onChange }: { scaling: StatScaling[]; onChange: (s: StatScaling[]) => void }) {
@@ -83,8 +103,33 @@ export function SegmentEditor({ value, onChange, onRemove, index }: { value: Eff
           <NumberField label="基础护盾量" value={v.basePower} step={5} min={0} onChange={(x) => set({ basePower: x })} />
           <NumberField label="持续(秒)" value={v.durationSeconds} step={1} min={0} onChange={(x) => set({ durationSeconds: x })} />
         </div>
+        <div className="grid grid-3">
+          <SelectField label="护盾类型" value={v.shieldType} options={SHIELD_TYPES} onChange={(x) => set({ shieldType: x as ShieldSegment['shieldType'] })} />
+          <SelectField label="刷新规则" value={v.refresh} options={SHIELD_REFRESH} onChange={(x) => set({ refresh: x as ShieldSegment['refresh'] })} />
+          <NumberField label="吸收优先级" value={v.priority} step={1} min={0} onChange={(x) => set({ priority: x })} />
+        </div>
         <SectionLabel>倍率</SectionLabel>
         <ScalingRows scaling={v.scaling} onChange={(x) => set({ scaling: x })} />
+      </div>
+    );
+  }
+
+  if (value.kind === 'cooldown_reduce') {
+    const v = value as CooldownReduceSegment;
+    return (
+      <div className="card" style={{ padding: 12 }}>
+        <div className="row" style={{ justifyContent: 'space-between' }}>
+          <b>冷却减少段 {index + 1}</b>
+          <button type="button" className="btn sm danger" onClick={onRemove}>移除</button>
+        </div>
+        <div className="grid grid-3">
+          <NumberField label="延迟(秒)" value={v.delaySeconds} step={0.1} min={0} onChange={(x) => set({ delaySeconds: x })} />
+          <NumberField label="减少冷却(秒)" value={v.seconds} step={0.5} min={0} onChange={(x) => set({ seconds: x })} />
+          <SelectField label="技能范围" value={v.target} options={COOLDOWN_TARGET} onChange={(x) => set({ target: x as CooldownReduceSegment['target'] })} />
+        </div>
+        <div className="row">
+          <ToggleField label="可超过当前剩余冷却" checked={v.allowOvershoot} onChange={(x) => set({ allowOvershoot: x })} />
+        </div>
       </div>
     );
   }
@@ -152,7 +197,33 @@ export function SegmentEditor({ value, onChange, onRemove, index }: { value: Eff
   );
 }
 
-/** 默认一段伤害片段 */
-export function defaultSegment(): EffectSegment {
-  return damageSegmentFactory(80, 'physical');
+/** 默认一段效果片段（可按类型创建） */
+export function defaultSegment(kind: EffectSegment['kind'] = 'damage'): EffectSegment {
+  switch (kind) {
+    case 'shield': return shieldSegmentFactory(200, 0);
+    case 'cooldown_reduce': return cooldownReduceSegmentFactory(1, 'ALL_SKILLS');
+    case 'heal': return { kind: 'heal', delaySeconds: 0, basePower: 100, scaling: [] };
+    case 'dot': return { kind: 'dot', delaySeconds: 0, totalSeconds: 3, tickSeconds: 1, baseDamagePerTick: 30, scaling: [], damageType: 'magic', canCrit: false, critFamily: 'physical', canTriggerItems: true, useAllVamp: true };
+    default: return damageSegmentFactory(80, 'physical');
+  }
+}
+
+export const SEGMENT_KINDS: Array<{ value: EffectSegment['kind']; label: string }> = [
+  { value: 'damage', label: '伤害' },
+  { value: 'dot', label: '持续伤害' },
+  { value: 'heal', label: '治疗' },
+  { value: 'shield', label: '护盾' },
+  { value: 'cooldown_reduce', label: '冷却减少' },
+];
+
+/** 「添加效果段」按钮：先选类型 */
+export function AddSegmentButton({ onAdd }: { onAdd: (kind: EffectSegment['kind']) => void }) {
+  return (
+    <div className="row" style={{ gap: 6, flexWrap: 'wrap' }}>
+      <span className="muted" style={{ fontSize: 12 }}>+ 添加效果段：</span>
+      {SEGMENT_KINDS.map((k) => (
+        <button type="button" key={k.value} className="btn sm" onClick={() => onAdd(k.value)}>{k.label}</button>
+      ))}
+    </div>
+  );
 }

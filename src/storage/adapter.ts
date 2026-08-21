@@ -8,7 +8,7 @@
  * 设计为「分层降级」：无 IndexedDB 环境（如隐私模式）可回退内存实现，不白屏。
  */
 import type {
-  BattlePreset, Equipment, Hero, SavedSimulation, Skill,
+  BattlePreset, Equipment, Hero, SavedSimulation, Skill, Talent, TalentBook,
 } from '../core/types';
 
 /** 各集合统一记录类型（id 为主键） */
@@ -18,11 +18,13 @@ export interface StorageSnapshot {
   heroes: Hero[];
   equipment: Equipment[];
   skills: Skill[];
+  talents: Talent[];
+  talentBooks: TalentBook[];
   battlePresets: BattlePreset[];
   savedSimulations: SavedSimulation[];
 }
 
-export type PresetKind = 'hero' | 'equipment' | 'skill' | 'preset' | 'sim';
+export type PresetKind = 'hero' | 'equipment' | 'skill' | 'talent' | 'talentBook' | 'preset' | 'sim';
 
 export interface StorageAdapter {
   readonly name: string;
@@ -42,6 +44,16 @@ export interface StorageAdapter {
   listSkills(): Promise<Skill[]>;
   saveSkill(s: Skill): Promise<void>;
   deleteSkill(id: string): Promise<void>;
+
+  // 天赋
+  listTalents(): Promise<Talent[]>;
+  saveTalent(t: Talent): Promise<void>;
+  deleteTalent(id: string): Promise<void>;
+
+  // 天赋页
+  listTalentBooks(): Promise<TalentBook[]>;
+  saveTalentBook(b: TalentBook): Promise<void>;
+  deleteTalentBook(id: string): Promise<void>;
 
   // 战斗方案模板
   listBattlePresets(): Promise<BattlePreset[]>;
@@ -69,6 +81,8 @@ export class MemoryAdapter implements StorageAdapter {
   private heroes = new Map<string, Hero>();
   private equip = new Map<string, Equipment>();
   private skills = new Map<string, Skill>();
+  private talents = new Map<string, Talent>();
+  private talentBooks = new Map<string, TalentBook>();
   private presets = new Map<string, BattlePreset>();
   private sims = new Map<string, SavedSimulation>();
 
@@ -84,6 +98,14 @@ export class MemoryAdapter implements StorageAdapter {
   async saveSkill(s: Skill) { this.skills.set(s.id, structuredClone(s)); }
   async deleteSkill(id: string) { this.skills.delete(id); }
 
+  async listTalents() { return [...this.talents.values()]; }
+  async saveTalent(t: Talent) { this.talents.set(t.id, structuredClone(t)); }
+  async deleteTalent(id: string) { this.talents.delete(id); }
+
+  async listTalentBooks() { return [...this.talentBooks.values()]; }
+  async saveTalentBook(b: TalentBook) { this.talentBooks.set(b.id, structuredClone(b)); }
+  async deleteTalentBook(id: string) { this.talentBooks.delete(id); }
+
   async listBattlePresets() { return [...this.presets.values()]; }
   async saveBattlePreset(p: BattlePreset) { this.presets.set(p.id, structuredClone(p)); }
   async deleteBattlePreset(id: string) { this.presets.delete(id); }
@@ -96,6 +118,8 @@ export class MemoryAdapter implements StorageAdapter {
     this.heroes = new Map(d.heroes.map((x) => [x.id, structuredClone(x)]));
     this.equip = new Map(d.equipment.map((x) => [x.id, structuredClone(x)]));
     this.skills = new Map(d.skills.map((x) => [x.id, structuredClone(x)]));
+    this.talents = new Map(d.talents.map((x) => [x.id, structuredClone(x)]));
+    this.talentBooks = new Map(d.talentBooks.map((x) => [x.id, structuredClone(x)]));
     this.presets = new Map(d.battlePresets.map((x) => [x.id, structuredClone(x)]));
     this.sims = new Map(d.savedSimulations.map((x) => [x.id, structuredClone(x)]));
   }
@@ -105,6 +129,8 @@ export class MemoryAdapter implements StorageAdapter {
       heroes: [...this.heroes.values()],
       equipment: [...this.equip.values()],
       skills: [...this.skills.values()],
+      talents: [...this.talents.values()],
+      talentBooks: [...this.talentBooks.values()],
       battlePresets: [...this.presets.values()],
       savedSimulations: [...this.sims.values()],
     };
@@ -124,6 +150,16 @@ export class MemoryAdapter implements StorageAdapter {
     if (kind === 'skill') {
       const m = this.skills.get(id);
       if (m) this.skills.set(id, ({ ...m, favorite: value } as unknown) as Skill);
+      return;
+    }
+    if (kind === 'talent') {
+      const m = this.talents.get(id);
+      if (m) this.talents.set(id, ({ ...m, favorite: value } as unknown) as Talent);
+      return;
+    }
+    if (kind === 'talentBook') {
+      const m = this.talentBooks.get(id);
+      if (m) this.talentBooks.set(id, ({ ...m, favorite: value } as unknown) as TalentBook);
       return;
     }
     if (kind === 'preset') {

@@ -16,6 +16,7 @@ const FILE_NAME = 'moba-simulator-backup.json';
 
 export function buildBackup(snapshot: {
   heroes: BackupFile['heroes']; equipment: BackupFile['equipment']; skills: BackupFile['skills'];
+  talents: BackupFile['talents']; talentBooks: BackupFile['talentBooks'];
   battlePresets: BackupFile['battlePresets']; savedSimulations: BackupFile['savedSimulations'];
 }): BackupFile {
   return {

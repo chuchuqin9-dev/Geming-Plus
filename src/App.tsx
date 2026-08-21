@@ -3,6 +3,7 @@ import { Home } from './pages/Home';
 import { Heroes } from './pages/Heroes';
 import { EquipmentLibrary } from './pages/Equipment';
 import { Skills } from './pages/Skills';
+import { Talents } from './pages/Talents';
 import { Combat } from './pages/Combat';
 import { Compare } from './pages/Compare';
 import { History } from './pages/History';
@@ -14,6 +15,7 @@ const NAV = [
   { to: '/heroes', label: '英雄库' },
   { to: '/equipment', label: '装备库' },
   { to: '/skills', label: '技能库' },
+  { to: '/talents', label: '天赋库' },
   { to: '/combat', label: '战斗模拟' },
   { to: '/compare', label: '方案对比' },
   { to: '/history', label: '历史记录' },
@@ -45,6 +47,7 @@ export default function App() {
           <Route path="/heroes" element={<Heroes />} />
           <Route path="/equipment" element={<EquipmentLibrary />} />
           <Route path="/skills" element={<Skills />} />
+          <Route path="/talents" element={<Talents />} />
           <Route path="/combat" element={<Combat />} />
           <Route path="/compare" element={<Compare />} />
           <Route path="/history" element={<History />} />
