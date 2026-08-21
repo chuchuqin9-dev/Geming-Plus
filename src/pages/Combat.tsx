@@ -7,8 +7,9 @@ import { buildCombatConfig } from '../core/combatConfig';
 import { Card, NumberField, SelectField, StatBox, ToggleField, num, pct, fmtTime } from '../components/ui';
 import { LineChart, ShareBars } from '../components/charts';
 import { damageShare, damageTypeShare, dpsUpTo, avgDps } from '../core/stats';
-import type { CombatConfig, CombatantId, CombatResult, Hero, Talent } from '../core/types';
+import type { CombatConfig, CombatantId, CombatResult, Hero, Skill, Talent } from '../core/types';
 import { MAX_EQUIPMENT } from '../core/types';
+import { resolveHeroSkills, describeSkillSegments } from '../core/heroSkills';
 
 export function Combat() {
   const { heroes, equipment, skills, talents, result, running, setCombatConfig, runSimulation, saveSimulation, clearResult } = useAppStore();
@@ -58,7 +59,7 @@ export function Combat() {
     <div>
       <div className="combat-cols">
         <Card title="英雄 A">
-          <HeroSetupPanel label="英雄 A" heroes={heroes} equipment={equipment} talents={talents} heroId={heroAId} onHeroId={setHeroAId} items={itemsA} onItems={setItemsA} selectedTalents={talentsA} onTalents={setTalentsA} />
+          <HeroSetupPanel label="英雄 A" heroes={heroes} equipment={equipment} talents={talents} librarySkills={skills} heroId={heroAId} onHeroId={setHeroAId} items={itemsA} onItems={setItemsA} selectedTalents={talentsA} onTalents={setTalentsA} />
         </Card>
 
         <Card title="战斗设置">
@@ -84,7 +85,7 @@ export function Combat() {
               </div>
             </div>
           ) : (
-            <HeroSetupPanel label="英雄 B" heroes={heroes} equipment={equipment} talents={talents} heroId={heroBId} onHeroId={setHeroBId} items={itemsB} onItems={setItemsB} selectedTalents={talentsB} onTalents={setTalentsB} />
+            <HeroSetupPanel label="英雄 B" heroes={heroes} equipment={equipment} talents={talents} librarySkills={skills} heroId={heroBId} onHeroId={setHeroBId} items={itemsB} onItems={setItemsB} selectedTalents={talentsB} onTalents={setTalentsB} />
           )}
         </Card>
       </div>
@@ -94,8 +95,8 @@ export function Combat() {
   );
 }
 
-function HeroSetupPanel({ label, heroes, equipment, talents, heroId, onHeroId, items, onItems, selectedTalents, onTalents }: {
-  label?: string; heroes: Hero[]; equipment: { id: string; name: string }[]; talents: Talent[]; heroId: string;
+function HeroSetupPanel({ label, heroes, equipment, talents, librarySkills, heroId, onHeroId, items, onItems, selectedTalents, onTalents }: {
+  label?: string; heroes: Hero[]; equipment: { id: string; name: string }[]; talents: Talent[]; librarySkills: Skill[]; heroId: string;
   onHeroId: (id: string) => void; items: string[]; onItems: (ids: string[]) => void; compact?: boolean;
   selectedTalents: string[]; onTalents: (ids: string[]) => void;
 }) {
@@ -106,6 +107,9 @@ function HeroSetupPanel({ label, heroes, equipment, talents, heroId, onHeroId, i
   // 可选天赋：通用（heroId=null）+ 该英雄专属
   const available = talents.filter((x) => !x.heroId || x.heroId === heroId);
   const toggleTalent = (id: string) => onTalents(selectedTalents.includes(id) ? selectedTalents.filter((x) => x !== id) : [...selectedTalents, id]);
+  // 已选英雄携带的技能（按 skillId 从技能库解析，实时反映英雄库配置）
+  const selHero = heroes.find((x) => x.id === heroId) ?? null;
+  const heroSkills = useMemo(() => selHero ? resolveHeroSkills(selHero, librarySkills) : [], [selHero, librarySkills]);
   return (
     <div>
       <label className="field"><span>选择英雄</span>
@@ -117,6 +121,19 @@ function HeroSetupPanel({ label, heroes, equipment, talents, heroId, onHeroId, i
 
       {heroId && (
         <>
+          <div className="section-label">{label} 已挂载技能（{heroSkills.length}）</div>
+          {heroSkills.length ? (
+            <div className="combat-skill-chips">
+              {heroSkills.map((s) => (
+                <span key={s.id} className={`chip ${s.type === 'active' ? 'chip-active' : 'chip-passive'}`} title={describeSkillSegments(s.segments)}>
+                  {s.type === 'active' ? '主动' : '被动'} · {s.name}
+                </span>
+              ))}
+            </div>
+          ) : (
+            <p className="muted" style={{ fontSize: 12, marginTop: 4 }}>该英雄未配置技能，战斗中只会普攻。</p>
+          )}
+
           <div className="section-label">装备槽（最多 {MAX_EQUIPMENT}）</div>
           <div className="equip-slots" style={{ display: 'flex', gap: 6, overflowX: 'auto', paddingBottom: 4 }}>
             {Array.from({ length: MAX_EQUIPMENT }).map((_, i) => {

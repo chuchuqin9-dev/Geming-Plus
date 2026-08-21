@@ -33,6 +33,23 @@ function combatant(hero: Hero, itemIds: string[] = [], label?: string) {
   return { label: label || hero.name, hero, itemIds };
 }
 
+/** 直达 release 链路构建配置并运行（模拟 Combat 页面：Hero.skillIds → 技能库 → 引擎） */
+function runViaPublicApi(opts: { hero: Hero; skills?: Skill[]; infinite?: boolean; duration?: number; maxHp?: number; attack?: number }) {
+  const lib = opts.skills ?? skillLib;
+  const byId = new Map<string, Equipment>();
+  const config = buildCombatConfig({
+    mode: 'dummy',
+    durationSeconds: opts.duration ?? 3,
+    randomMode: 'expectation',
+    skills: lib,
+    heroA: opts.hero,
+    itemsA: [],
+    dummy: { infiniteHp: opts.infinite ?? true, maxHp: opts.maxHp ?? 100000, armor: 0, magicResist: 0, damageReduction: 0 },
+    skillPriorityA: opts.hero.skills,
+  });
+  return runCombat(config, byId);
+}
+
 function run(
   opts: {
     heroes: Hero[]; items?: Equipment[]; itemsA?: string[]; itemsB?: string[];
@@ -429,5 +446,57 @@ describe('#178 防无限触发 / 禁疗', () => {
     const ra = result.results.find((x) => x.id === 'A')!;
     expect(ra.finalHp).toBe(1500); // 300 治疗被 100% 禁疗抵消
     expect(ra.lifesteal.totalHealing).toBe(0);
+  });
+});
+
+// =========================================================================
+// 发布链路回归：#issue 战斗模拟系统（技能触发 / 木桩无限生命值）
+// =========================================================================
+
+describe('战斗模拟发布链路：英雄技能正常触发（Issue 1）', () => {
+  it('Hero.skillIds 引用技能库 → buildCombatConfig 解析 → 引擎释放技能并计入伤害', () => {
+    const h = hero('A', { attack: 10 });
+    // 技能库里定义 3 个主动技能（短冷却，几率触发）
+    const fire = { ...skillOf({ cd: 1 }), name: '火球', segments: [{ kind: 'damage', delaySeconds: 0, baseDamage: 200, scaling: [], damageType: 'true', canCrit: false, critFamily: 'physical', canLifesteal: true, canTriggerItems: true, sourceKind: 'skill', isSkillBoost: true, useMagicDamageBoost: true }] };
+    const ice = { ...skillOf({ cd: 2 }), name: '冰锥', segments: [{ kind: 'damage', delaySeconds: 0, baseDamage: 150, scaling: [], damageType: 'true', canCrit: false, critFamily: 'physical', canLifesteal: true, canTriggerItems: true, sourceKind: 'skill', isSkillBoost: true, useMagicDamageBoost: true }] };
+    bind(h, fire, ice); // 英雄只存技能 id 引用
+    const result = runViaPublicApi({ hero: h, skills: skillLib, duration: 4 });
+    const ra = result.results.find((x) => x.id === 'A')!;
+    // 技能确实命中伤害结算：技能伤害桶 > 0，且普攻输出（10×4=40）占比小
+    expect(ra.damage.skill).toBeGreaterThan(0);
+    // 冷却 1s / 2s：2s 内火球可放 2 次、冰锥 1 次，4s 内火球 4 次、冰锥 2 次
+    const fireRow = ra.skills.find((s) => s.name === '火球');
+    const iceRow = ra.skills.find((s) => s.name === '冰锥');
+    expect(fireRow?.castCount).toBeGreaterThanOrEqual(4);
+    expect(iceRow?.castCount).toBeGreaterThanOrEqual(2);
+    expect(fireRow!.damage).toBe(200 * fireRow!.castCount);
+    expect(iceRow!.damage).toBe(150 * iceRow!.castCount);
+    // 技能呼应触发后被记录到日志
+    expect(result.events.some((e) => e.eventType === 'skill_cast' && e.skillName === '火球')).toBe(true);
+  });
+});
+
+describe('战斗模拟：木桩无限生命值（Issue 3）', () => {
+  it('infiniteHp=true：满血持续受击、不死亡、战斗不提前结束、DPS 持续累计', () => {
+    // 一击 50000 远超木桩 10000 血，若未实现无限生命会立即打穿
+    const h = hero('A', { attack: 50000 });
+    const result = runViaPublicApi({ hero: h, duration: 3, infinite: true, maxHp: 10000 });
+    const dump = result.results.find((x) => x.isDummy)!;
+    const ra = result.results.find((x) => x.id === 'A')!;
+    expect(dump.alive).toBe(true);                 // 保持存活
+    expect(dump.finalHp).toBe(10000);              // 生命始终为最大值
+    expect(result.durationMs).toBeGreaterThanOrEqual(3000); // 打满时长，不提前结束
+    expect(result.endReason).toBe('timeout');
+    expect(ra.damage.basicAttack).toBe(50000 * 4); // 0/1/2/3 共 4 击，未因木桩死亡锁定目标
+  });
+
+  it('infiniteHp=false：木桩血尽即死亡并结束战斗', () => {
+    const h = hero('A', { attack: 50000 });
+    const result = runViaPublicApi({ hero: h, duration: 10, infinite: false, maxHp: 50000 });
+    const dump = result.results.find((x) => x.isDummy)!;
+    expect(result.endReason).toBe('victory');
+    expect(result.durationMs).toBeLessThan(3000);  // 第 2 击（1s）打穿 50000 即结束
+    expect(dump.alive).toBe(false);
+    expect(dump.finalHp).toBe(0);
   });
 });

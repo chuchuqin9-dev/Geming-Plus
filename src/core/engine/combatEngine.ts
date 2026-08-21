@@ -817,6 +817,13 @@ export class CombatEngine {
     const priorAlive = target.combatant.alive;
     target.combatant.alive = target.combatant.hp > 0;
 
+    // 木桩无限生命：伤害照常结算并记录（DPS/日志正常），但生命立刻回满、保持存活，
+    // 使英雄可以持续打桩测试输出而不因木桩死亡终止或锁定目标。
+    if (target.isDummy && this.config.dummy.infiniteHp) {
+      target.combatant.hp = target.combatant.maxHp;
+      target.combatant.alive = true;
+    }
+
     this.emit(crit ? 'crit' : seg.kind === 'dot' ? 'dot_tick' : 'damage', source.id, target.id, {
       skillId: meta.skillId, skillName: meta.skillName, itemId: meta.itemId, itemName: meta.itemName,
       talentId: meta.talentId, talentName: meta.talentName,

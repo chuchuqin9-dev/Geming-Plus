@@ -190,6 +190,17 @@ td.num, th.num { text-align: right; font-family: var(--mono); }
 /* 三栏战斗布局 */
 .combat-cols { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; align-items: start; }
 
+/* 已挂载技能标签 */
+.combat-skill-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  border: 1px solid var(--border); border-radius: 999px;
+  padding: 3px 9px; font-size: 12px; background: var(--bg-elev);
+  white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis;
+}
+.chip-active { border-color: var(--brand); color: var(--brand); }
+.chip-passive { border-color: var(--magic); color: var(--magic); }
+
 /* 响应式 */
 @media (max-width: 1024px) {
   .combat-cols { grid-template-columns: 1fr; }
