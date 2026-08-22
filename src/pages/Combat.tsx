@@ -261,6 +261,10 @@ function ResultView({ result, onSave, onClear }: { result: CombatResult; onSave:
 
       {primary && primary.skills.length > 0 && (
         <Card title="技能贡献">
+          <div className="row" style={{ justifyContent: 'space-between', marginBottom: 8 }}>
+            <span className="muted" style={{ fontSize: 12 }}>技能贡献明细</span>
+            <span className="muted" style={{ fontSize: 12 }}>普通攻击次数：{primary.damage.basicAttackCount}</span>
+          </div>
           <table>
             <thead><tr><th>技能</th><th className="num">释放</th><th className="num">命中</th><th className="num">总伤</th><th className="num">暴击</th><th className="num">占比</th><th className="num">平均</th></tr></thead>
             <tbody>

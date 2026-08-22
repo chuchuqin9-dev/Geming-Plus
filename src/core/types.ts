@@ -255,7 +255,11 @@ export type StatKey =
   | 'targetMaxHp' | 'targetCurrentHp' | 'targetLostHp'
   | 'targetAttack' | 'targetAp'
   /** 原始伤害（Raw Damage）：当前效果段的基础伤害/基础数值，随原始伤害成长 */
-  | 'rawDamage';
+  | 'rawDamage'
+  /** 原始伤害 → 普通攻击：引用来源英雄最近一次普通攻击产生的原始伤害（#原始伤害来源） */
+  | 'rawBasicAttackDamage'
+  /** 原始伤害 → 技能伤害：引用来源英雄最近一次技能造成的原始伤害（#原始伤害来源） */
+  | 'rawSkillDamage';
 
 /** 公式中的一项：伤害 += 属性值 × ratio */
 export interface StatScaling {
@@ -823,6 +827,10 @@ export interface CombatantRuntimeState {
   tempAttackSpeed: number;
   /** 临时攻速上限突破（百分比 0-100） */
   tempCapBreakthrough: number;
+  /** 最近一次普攻产生的原始伤害（原始伤害→普通攻击 的数据源） */
+  lastBasicAttackRaw: number;
+  /** 最近一次技能造成的原始伤害（原始伤害→技能伤害 的数据源） */
+  lastSkillRaw: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -936,6 +944,8 @@ export interface DmgStat {
   critDamage: number;
   critCount: number;
   hitCount: number;
+  /** 普通攻击次数 */
+  basicAttackCount: number;
 }
 
 export interface LifestealStat {

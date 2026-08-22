@@ -7,7 +7,9 @@ import { damageSegmentFactory, cooldownReduceSegmentFactory, shieldSegmentFactor
 import { NumberField, SelectField, ToggleField, SectionLabel } from './ui';
 
 const STAT_OPTIONS: Array<{ value: StatKey; label: string }> = [
-  { value: 'rawDamage', label: '原始伤害（基础伤害）' },
+  { value: 'rawDamage', label: '原始伤害（自身基础伤害）' },
+  { value: 'rawBasicAttackDamage', label: '原始伤害 · 普通攻击' },
+  { value: 'rawSkillDamage', label: '原始伤害 · 技能伤害' },
   { value: 'maxHp', label: '自身最大生命' },
   { value: 'currentHp', label: '自身当前生命' },
   { value: 'lostHp', label: '自身已损失生命' },

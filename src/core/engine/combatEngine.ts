@@ -161,6 +161,8 @@ function makeRuntimeState(id: CombatantId): CombatantRuntimeState {
     consecutive: { current: 0, lastAttackTimeMs: -1, allowedGapMs: 1500, isAttacking: false },
     tempAttackSpeed: 0,
     tempCapBreakthrough: 0,
+    lastBasicAttackRaw: 0,
+    lastSkillRaw: 0,
   };
 }
 
@@ -188,7 +190,7 @@ interface RunAccum {
   damage: {
     total: number; physical: number; magic: number; trueDmg: number;
     basicAttack: number; skill: number; item: number; dot: number;
-    critDamage: number; critCount: number; hitCount: number;
+    critDamage: number; critCount: number; hitCount: number; basicAttackCount: number;
   };
   lifesteal: { totalHealing: number; overheal: number; physicalVamp: number; magicVamp: number; allVamp: number; onHitHp: number };
   defense: {
@@ -333,7 +335,7 @@ export class CombatEngine {
 
   private emptyAccum(): RunAccum {
     return {
-      damage: { total: 0, physical: 0, magic: 0, trueDmg: 0, basicAttack: 0, skill: 0, item: 0, dot: 0, critDamage: 0, critCount: 0, hitCount: 0 },
+      damage: { total: 0, physical: 0, magic: 0, trueDmg: 0, basicAttack: 0, skill: 0, item: 0, dot: 0, critDamage: 0, critCount: 0, hitCount: 0, basicAttackCount: 0 },
       lifesteal: { totalHealing: 0, overheal: 0, physicalVamp: 0, magicVamp: 0, allVamp: 0, onHitHp: 0 },
       defense: { damageTaken: 0, physicalTaken: 0, magicTaken: 0, trueTaken: 0, shieldAbsorbed: 0, shieldGenerated: 0, shieldsGained: 0, shieldTotal: 0, shieldMaxSingle: 0, physicalShieldAbsorbed: 0, magicShieldAbsorbed: 0, allShieldAbsorbed: 0, shieldBroken: 0, shieldExpired: 0 },
       skills: new Map(),
@@ -543,7 +545,8 @@ export class CombatEngine {
       sourceKind: 'basic_attack', sourceType: 'basic_attack',
       skillId: BASIC_ATTACK_SKILL_MARKER, skillName: '普通攻击',
     });
-    this.fireTriggers(unit, 'basic_attack_hit', atMs, {});
+    // basic_attack_hit 由 dealDamage 统一触发（在原始伤害缓存之后、且仅当伤害真正产生），
+    // 这里不再重复触发，避免 on_basic_attack_hit 被动/装备/天赋每次普攻触发两次。
     this.fireTriggers(unit, 'on_attack', atMs, {}); // 兼容旧枚举：攻击时
 
     // 攻速上限解析（#131-133）：最终间隔受最低间隔约束，攻速来自 buff（#134）且不写回模板
@@ -764,6 +767,14 @@ export class CombatEngine {
     }
     if (crit) { this.setStateTag(source, 'LAST_ATTACK_CRITICAL', true); this.setStateTag(source, 'HAS_CRIT_THIS_COMBAT', true); }
     else if (sourceKind === 'basic_attack') this.setStateTag(source, 'LAST_ATTACK_CRITICAL', false);
+
+    // 6.5) 缓存本次原始伤害（原始伤害→普通攻击 / 原始伤害→技能伤害 的数据源）。
+    // 在本回合任何 before_damage / basic_attack_hit / damage_dealt 触发链运行之前写入，
+    // 使被触发的技能（如被动技能E）能用 rawBasicAttackDamage / rawSkillDamage 读取到本次原始伤害。
+    if (source.hero) {
+      if (sourceKind === 'basic_attack') source.hero.runtime.lastBasicAttackRaw = raw;
+      else if (sourceKind === 'skill' || sourceKind === 'dot') source.hero.runtime.lastSkillRaw = raw;
+    }
 
     // 7) BEFORE_DAMAGE（#142-143）：伤害已产生、尚未扣护盾/生命，允许技能/装备/天赋生成护盾等防御
     // 仅当确实产生伤害（raw>0）时触发，避免 0 伤害的命中触发无效防御（见 #142「伤害已经产生」）
@@ -1271,6 +1282,10 @@ export class CombatEngine {
       case 'targetAp': return tgt.ap;
       // 原始伤害（#95）：引用当前效果段的基础数值（如基础伤害/基础治疗量），随原始伤害成长
       case 'rawDamage': return rawBase || 0; 
+      // 原始伤害 → 普通攻击：来源英雄最近一次普攻的原始伤害
+      case 'rawBasicAttackDamage': return source.hero?.runtime.lastBasicAttackRaw ?? 0;
+      // 原始伤害 → 技能伤害：来源英雄最近一次技能/持续伤害的原始伤害
+      case 'rawSkillDamage': return source.hero?.runtime.lastSkillRaw ?? 0; 
       default: return 0;
     }
   }
@@ -1586,7 +1601,7 @@ export class CombatEngine {
     D.physical += damageType === 'physical' ? landed : 0;
     D.magic += damageType === 'magic' ? landed : 0;
     D.trueDmg += damageType === 'true' ? landed : 0;
-    if (bucket === 'basic_attack') D.basicAttack += landed;
+    if (bucket === 'basic_attack') { D.basicAttack += landed; D.basicAttackCount++; }
     else if (bucket === 'skill') D.skill += landed;
     else if (bucket === 'item') D.item += landed;
     else D.dot += landed;
